@@ -16,10 +16,10 @@ st.title("🧠 NeuroGait Agent — NL ↔ Cypher (ASD/TD)")
 
 # ---------- Sidebar ----------
 with st.sidebar:
-    st.header("Neo4j")
-    uri = st.text_input("URI", "bolt://localhost:7687")
-    user = st.text_input("User", "neo4j")
-    password = st.text_input("Password", type="password", value=os.getenv("NEO4J_PASSWORD","palatiou"))
+    uri = st.text_input("URI", os.getenv("NEO4J_URI","bolt://localhost:7687"))
+    user = st.text_input("User", os.getenv("NEO4J_USER","neo4j"))
+    password = st.text_input("Password", type="password",
+                             value=os.getenv("NEO4J_PASSWORD","palatiou"))
     st.divider()
     st.header("Model")
     st.caption("Χρησιμοποιείται δωρεάν small model (HuggingFace FLAN-T5-Small).")
