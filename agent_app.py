@@ -44,10 +44,15 @@ def sanitize_question(q: str) -> str:
         q = q[:MAX_QUESTION_CHARS]
     return q
 
+def ensure_new_call_syntax(cy: str) -> str:
+    """Αντικαθιστά την παλιά CALL { ... } με CALL () { ... } για να φύγει το deprecation warning."""
+    # μόνο όταν ανοίγει αμέσως block
+    return re.sub(r'(?i)\bCALL\s*{', 'CALL () {', cy)
+
 # ---------- Load resources ----------
 @st.cache_resource
 def get_generator():
-    # NL2Cypher εσωτερικά κάνει HF pipeline· εδώ δεν αλλάζουμε το lib, απλά το “προστατεύουμε” απ' τα inputs
+    # NL2Cypher εσωτερικά κάνει HF pipeline
     return NL2Cypher()
 
 @st.cache_resource
@@ -134,8 +139,8 @@ def rule_based_fallback(user_q: str) -> str:
     ankle_code = "KNFOR" if side == "R" else "KNFOL"
 
     if "coupling" in uq or "συσχ" in uq or "αύξηση" in uq:
-        # per-subject OLS coupling knee→ankle
-        return f"""
+        # per-subject OLS coupling knee→ankle (νέα σύνταξη)
+        cy = f"""
 CALL () {{
   WITH *
   UNWIND [ ['L','HIANL','KNFOL'], ['R','HIANR','KNFOR'] ] AS cfg
@@ -168,6 +173,7 @@ CALL () {{
 RETURN condition, side, n, beta, alpha, R2, delta_for_plus5
 ORDER BY side;
         """.strip()
+        return cy
 
     # αλλιώς απλό “mean by joint”
     target_code = knee_code if ("knee" in uq or "γόνα" in uq) else ankle_code
@@ -186,19 +192,23 @@ def generate_cypher(user_q: str) -> str:
     if not cleaned:
         return ""
     try:
-        cy = generator(cleaned, synonyms, fewshots)  # η NL2Cypher σου
+        cy = generator(cleaned, synonyms, fewshots)  # η NL2Cypher σου κάνει sanitize & validity check
         if not isinstance(cy, str) or not cy.strip():
-            raise ValueError("Empty Cypher from model")
+            raise ValueError("Empty/invalid Cypher from model")
+        cy = ensure_new_call_syntax(cy)
         return cy
     except Exception as e:
         st.warning(f"Model fallback (rule-based): {e}")
-        return rule_based_fallback(cleaned)
+        cy = rule_based_fallback(cleaned)
+        return ensure_new_call_syntax(cy)
 
 # --- UI controls for NL2Cypher/Exec ---
 colA, colB = st.columns([1,1])
 with colA:
     if st.button("🧠 Generate Cypher"):
         cy = generate_cypher(q)
+        if not cy.strip():
+            st.warning("Το μοντέλο δεν παρήγαγε έγκυρο Cypher. Δοκίμασε να ρωτήσεις πιο συγκεκριμένα ή χρησιμοποίησε τα Quick actions.")
         st.session_state["last_cypher"] = cy
 
 with colB:
@@ -209,8 +219,7 @@ with colB:
             st.warning("Δεν υπάρχει Cypher για εκτέλεση.")
         else:
             try:
-                rows = st.session_state["db"].run(cy)
-                st.session_state["last_rows"] = rows
+                rows = st.session_state["last_rows"] = st.session_state["db"].run(cy)
                 st.success(f"OK — {len(rows)} γραμμές.")
             except neo4j_ex.Neo4jError as e:
                 st.error(f"Neo4j error: {e}")
@@ -243,11 +252,15 @@ qa1, qa2, qa3 = st.columns(3)
 with qa1:
     disabled = st.session_state["db"] is None
     if st.button("📊 Knee→Ankle (per-subject OLS, ASD/TD, L/R)", disabled=disabled):
-        # Χρησιμοποιώ το fewshot (ενημέρωσε το template σου σε CALL () { WITH * ... } αν θες να φύγει το deprecation warning)
+        # Πάρε το fewshot και διόρθωσε τυχόν παλιό CALL { ... } -> CALL () { ... }
         fs = [fs for fs in fewshots if "coupling per subject" in fs.get("q","").lower()]
         if fs:
-            st.session_state["last_cypher"] = fs[0]["cypher"]
-            st.session_state["last_rows"] = st.session_state["db"].run(fs[0]["cypher"])
+            cy = ensure_new_call_syntax(fs[0]["cypher"])
+            st.session_state["last_cypher"] = cy
+            try:
+                st.session_state["last_rows"] = st.session_state["db"].run(cy)
+            except Exception as e:
+                st.error(f"Exec error: {e}")
 
 with qa2:
     if st.button("🧩 Clinician explanation row"):
@@ -258,7 +271,8 @@ with qa2:
         )
 
 with qa3:
-    if enable_ml and st.button("🤖 ML demo (XGB/Linear) ASD Right: predict Ankle from Knee/Hip/StaT/Velocity", disabled=disabled):
+    disabled = st.session_state["db"] is None or not enable_ml
+    if st.button("🤖 ML demo (XGB/Linear) ASD Right: predict Ankle from Knee/Hip/StaT/Velocity", disabled=disabled):
         df = pd.DataFrame(st.session_state["db"].run("""
 MATCH (p:Subject)-[:HAS_CONDITION]->(:Condition {name:'ASD'})
 MATCH (p)-[:HAS_SAMPLE]->(s:Sample)
