@@ -1,0 +1,8 @@
+[
+  {"intent":"count_subjects_by_condition", "patterns": ["\\bhow\\s+many\\b.*\\basd\\b", "\\bπόσοι\\b.*\\basd\\b"]},
+  {"intent":"count_subjects", "patterns": ["\\bhow\\s+many\\b.*(subjects|participants|cases)\\b", "πόσοι .* (συμμετέχ|υποκείμεν)"]},
+  {"intent":"mean_joint_side_condition", "patterns": [
+    "(mean|μέση).*\\b(knee|γόνατο|ankle|ποδοκνημική|hip|ισχίο)\\b.*(left|right|αρισ|δεξ).*\\b(asd|td|typical)\\b"
+  ]},
+  {"intent":"coupling_knee_ankle", "patterns": ["\\b(coupling|συσχ|συσχέτιση)\\b.*(knee|γόνατο).*\\b(ankle|ποδοκνημική)\\b"]}
+]

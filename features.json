@@ -1,0 +1,20 @@
+{
+  "joint_aliases": {
+    "knee": ["knee","γόνατο"], "ankle": ["ankle","ποδοκνημική","ποδοκνημικη"],
+    "hip": ["hip","ισχίο","ισχιο"], "trunk": ["trunk","κορμός","κορμος","spine","θωρακικός","θωρακικος"]
+  },
+  "code_regex": {
+    "knee_L": "(?i).*HIANL\\s*$",
+    "knee_R": "(?i).*HIANR\\s*$",
+    "ankle_L": "(?i).*KNFOL\\s*$",
+    "ankle_R": "(?i).*KNFOR\\s*$",
+    "hip_L":   "(?i).*SPKNL\\s*$",
+    "hip_R":   "(?i).*SPKNR\\s*$",
+    "trunk_L": "(?i).*THHTIL\\s*$",
+    "trunk_R": "(?i).*THHTIR\\s*$"
+  },
+  "metrics": {
+    "mean": "mean", "average": "mean", "μέση": "mean",
+    "std": "std", "variance": "variance"
+  }
+}

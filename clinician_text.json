@@ -1,0 +1,3 @@
+{
+  "coupling_explanation": "How to read this table: 'condition' is the group (ASD/TD). 'side' is limb (L/R). 'n' is participants (≈50/group). 'beta' shows the expected change of the ankle angle (°) per +1° change in the knee mean angle. 'alpha' is the ankle baseline when knee=0° (limited clinical meaning). 'R²' expresses how tightly the ankle follows the knee (0–1). 'delta_for_plus5' is the expected change at the ankle (°) for a +5° increase at the knee. Clinically, higher beta suggests stronger mechanical/neuromuscular coupling; low R² (<0.2) indicates weak coupling or high between-subject variability."
+}

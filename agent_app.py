@@ -2,7 +2,6 @@
 # -*- coding: utf-8 -*-
 import os
 import re
-import json
 from typing import Dict, Any, List, Optional, Tuple
 
 import pandas as pd
@@ -26,7 +25,7 @@ with st.sidebar:
 
     st.divider()
     st.header("Model")
-    st.caption("Small free SLM (HF FLAN-T5-Small) — χρησιμοποιείται μόνο αν δεν αναγνωρίσει το intent ο κανόνας.")
+    st.caption("Small free SLM (HF FLAN-T5-Small) — χρησιμοποιείται μόνο όταν δεν αναγνωριστεί το intent από τους κανόνες.")
     show_cypher = st.checkbox("Προβολή Cypher", value=True)
     enable_ml = st.checkbox("Ενεργοποίηση ML panel (XGBoost/Linear)", value=False)
 
@@ -98,11 +97,9 @@ with col_ping:
 
 db: Optional[Neo4jClient] = st.session_state.get("db")
 
-# ---------- Helpers: parsing & dictionaries ----------
-
+# ---------- Dictionaries / parsing helpers ----------
 JOINT_MAP = {
     # joint keyword -> (code stem, nice name)
-    # angles
     "knee":   ("HIAN", "Knee"),
     "γονατ":  ("HIAN", "Knee"),
     "ankle":  ("KNFO", "Ankle"),
@@ -120,7 +117,6 @@ JOINT_MAP = {
 }
 
 SPATIOTEMPORAL = {
-    # plain feature codes in your KG
     "stride length": ("StrLe", "m"),
     "step length":   ("MaxStLe", "m"),
     "step width":    ("MaxStWi", "m"),
@@ -133,14 +129,14 @@ SPATIOTEMPORAL = {
 def detect_condition(uq: str) -> str:
     if re.search(r"\b(asd|αυτισ)\b", uq): return "ASD"
     if re.search(r"\b(td|typical|τυπικ)\b", uq): return "TD"
-    if re.search(r"\b(asd\s*vs\s*td|td\s*vs\s*asd|compare|diff|διαφορ)\b", uq): return "BOTH"
-    return "ASD"  # default
+    if re.search(r"(asd\s*vs\s*td|td\s*vs\s*asd|compare|diff|διαφορ)", uq): return "BOTH"
+    return "ASD"
 
 def detect_side(uq: str) -> str:
-    if re.search(r"\b(right|δεξ)\b", uq): return "R"
-    if re.search(r"\b(left|αρισ|αρ\.)\b", uq): return "L"
-    if re.search(r"\b(both|and both|και τα δυο|bilateral)\b", uq): return "BOTH"
-    return "R"  # default
+    if re.search(r"(right|δεξ)", uq): return "R"
+    if re.search(r"(left|αρισ|αρ\.)", uq): return "L"
+    if re.search(r"(both|και τα δυο|bilateral)", uq): return "BOTH"
+    return "R"
 
 def find_joint(uq: str) -> Optional[Tuple[str,str]]:
     for k,(stem,nice) in JOINT_MAP.items():
@@ -158,24 +154,17 @@ def asks_std(uq: str) -> bool:
     return any(w in uq for w in ["std", "stdev", "τυπικ", "διακ"])
 
 def asks_coupling(uq: str) -> Optional[Tuple[str,str]]:
-    """
-    Returns pair (source_joint_stem, target_joint_stem) for OLS if found.
-    Examples:
-      knee->ankle, hip->knee, knee->trunk …
-    """
     pairs = [
         (["knee","γονατ"], ["ankle","ποδοκν"]),
-        (["hip","ισχυ"], ["knee","γονατ"]),
+        (["hip","ισχυ"],   ["knee","γονατ"]),
         (["knee","γονατ"], ["trunk","κορμ"]),
     ]
     for src_list, tgt_list in pairs:
         if any(k in uq for k in src_list) and any(k in uq for k in tgt_list):
-            # map to stems
             src = next(JOINT_MAP[k][0] for k in JOINT_MAP if k in uq and k in src_list)
             tgt = next(JOINT_MAP[k][0] for k in JOINT_MAP if k in uq and k in tgt_list)
             return src, tgt
     if any(w in uq for w in ["coupling","συσχ","συσχετ","regression","ols"]):
-        # default knee->ankle
         return "HIAN","KNFO"
     return None
 
@@ -188,28 +177,24 @@ def spatiotemporal_key(uq: str) -> Optional[Tuple[str,str]]:
 def feature_regex_from_text(uq: str) -> Optional[str]:
     m = re.search(r"(features?|χαρακτηριστικ|codes?|κωδικ\w+)\s*(like|όπως|regex|=)\s*([A-Za-z0-9\.\-\_\*]+)", uq)
     if m:
-        pat = m.group(3)
-        # turn glob to regex-ish (very simple)
-        pat = pat.replace("*", ".*")
+        pat = m.group(3).replace("*", ".*")
         return pat
     return None
 
 # ---------- Intent → Cypher (Rule-based) ----------
 
 def cy_mean_per_subject(cond: str, side: str, joint_stem: str, joint_name: str, stat="mean") -> str:
-    # Build regex suffix based on side
-    code = f"{joint_stem}{'R' if side=='R' else 'L'}" if side in ("L","R") else ""
-    side_filter = (
-        f"f.code =~ '(?i).*{joint_stem}L\\s*$' OR f.code =~ '(?i).*{joint_stem}R\\s*$'"
-        if side == "BOTH" else f"f.code =~ '(?i).*{code}\\s*$'"
-    )
+    if side == "BOTH":
+        side_filter = f"(f.code =~ '(?i).*{joint_stem}L\\s*$' OR f.code =~ '(?i).*{joint_stem}R\\s*$')"
+    else:
+        side_filter = f"f.code =~ '(?i).*{joint_stem}{side}\\s*$'"
     cond_filter = "" if cond == "BOTH" else f"WHERE c.name='{cond}'"
     return f"""
 MATCH (p:Subject)-[:HAS_CONDITION]->(c:Condition)
 {cond_filter}
 MATCH (p)-[:HAS_SAMPLE]->(s:Sample)
 MATCH (s)-[:HAS_VALUE]->(fv:FeatureValue)-[:OF_FEATURE]->(f:Feature)
-WHERE f.stat='{stat}' AND ({side_filter})
+WHERE f.stat='{stat}' AND {side_filter}
 WITH c.name AS condition,
      CASE WHEN f.code =~ '(?i).*L\\s*$' THEN 'L' ELSE 'R' END AS side,
      p.pid AS pid, avg(fv.value) AS subj_mean
@@ -229,29 +214,25 @@ RETURN condition, round(avg(subj_mean),3) AS mean_value, count(*) AS n
 ORDER BY condition
 """.strip()
 
-def cy_coupling_ols(cond: str, side: str, src_stem: str, tgt_stem: str) -> str:
-    def pattern(stem,side):
-        if side == "BOTH":
-            return f"f.code =~ '(?i).*{stem}L\\s*$' OR f.code =~ '(?i).*{stem}R\\s*$'"
-        return f"f.code =~ '(?i).*{stem}{side}\\s*$'"
+def cy_unwind_sides(side: str) -> str:
+    # αξιόπιστο UNWIND για μία ή δύο πλευρές
+    return f"WITH CASE WHEN '{side}'='BOTH' THEN ['L','R'] ELSE ['{side}'] END AS sides\nUNWIND sides AS side"
 
+def cy_coupling_ols(cond: str, side: str, src_stem: str, tgt_stem: str) -> str:
     cond_filter = "" if cond == "BOTH" else f"WHERE c.name='{cond}'"
     return f"""
-UNWIND [{ "'L','R'" if side=='BOTH' else f"'{side}'" }] AS side
+{cy_unwind_sides(side)}
+WITH side, '{src_stem}' AS src_stem, '{tgt_stem}' AS tgt_stem
 MATCH (p:Subject)-[:HAS_CONDITION]->(c:Condition)
 {cond_filter}
 MATCH (p)-[:HAS_SAMPLE]->(s:Sample)
-
 // source X
 MATCH (s)-[:HAS_VALUE]->(xv:FeatureValue)-[:OF_FEATURE]->(xf:Feature)
-WHERE xf.stat='mean' AND ({pattern(src_stem, 'L' if side=='BOTH' else side)})
-
+WHERE xf.stat='mean' AND xf.code =~ ('(?i).*' + src_stem + side + '\\s*$')
 // target Y
 MATCH (s)-[:HAS_VALUE]->(yv:FeatureValue)-[:OF_FEATURE]->(yf:Feature)
-WHERE yf.stat='mean' AND ({pattern(tgt_stem,'L' if side=='BOTH' else side)})
-
-WITH c.name AS condition, side, p.pid AS pid,
-     avg(xv.value) AS X, avg(yv.value) AS Y
+WHERE yf.stat='mean' AND yf.code =~ ('(?i).*' + tgt_stem + side + '\\s*$')
+WITH c.name AS condition, side, p.pid AS pid, avg(xv.value) AS X, avg(yv.value) AS Y
 WITH condition, side, collect(X) AS Xs, collect(Y) AS Ys
 WITH condition, side, Xs, Ys, size(Xs) AS n,
      reduce(a=0.0, v IN Xs | a+v) AS sx,
@@ -282,7 +263,6 @@ ORDER BY condition
 """.strip()
 
 def cy_list_features(regex_like: str) -> str:
-    # user pattern already simple ".*"
     return f"""
 MATCH (f:Feature)
 WHERE f.code =~ '(?i).*{regex_like}.*'
@@ -298,25 +278,19 @@ ORDER BY condition
 """.strip()
 
 def cy_correlation(cond: str, side: str, a_stem: str, b_stem: str) -> str:
-    def pattern(stem,side):
-        if side == "BOTH":
-            return f"f.code =~ '(?i).*{stem}L\\s*$' OR f.code =~ '(?i).*{stem}R\\s*$'"
-        return f"f.code =~ '(?i).*{stem}{side}\\s*$'"
     cond_filter = "" if cond == "BOTH" else f"WHERE c.name='{cond}'"
     return f"""
-UNWIND [{ "'L','R'" if side=='BOTH' else f"'{side}'" }] AS side
+{cy_unwind_sides(side)}
+WITH side, '{a_stem}' AS a_stem, '{b_stem}' AS b_stem
 MATCH (p:Subject)-[:HAS_CONDITION]->(c:Condition)
 {cond_filter}
 MATCH (p)-[:HAS_SAMPLE]->(s:Sample)
-
 // A
 MATCH (s)-[:HAS_VALUE]->(av:FeatureValue)-[:OF_FEATURE]->(af:Feature)
-WHERE af.stat='mean' AND ({pattern(a_stem, 'L' if side=='BOTH' else side)})
-
+WHERE af.stat='mean' AND af.code =~ ('(?i).*' + a_stem + side + '\\s*$')
 // B
 MATCH (s)-[:HAS_VALUE]->(bv:FeatureValue)-[:OF_FEATURE]->(bf:Feature)
-WHERE bf.stat='mean' AND ({pattern(b_stem, 'L' if side=='BOTH' else side)})
-
+WHERE bf.stat='mean' AND bf.code =~ ('(?i).*' + b_stem + side + '\\s*$')
 WITH c.name AS condition, side, p.pid AS pid, avg(av.value) AS A, avg(bv.value) AS B
 WITH condition, side, collect(A) AS As, collect(B) AS Bs
 WITH condition, side, As, Bs, size(As) AS n,
@@ -335,13 +309,15 @@ ORDER BY condition, side
 
 def intent_router(user_q: str) -> Optional[Tuple[str,str]]:
     """
-    Tries to understand the query and returns (cypher, tag).
+    Returns (cypher, tag).
     tag ∈ {"mean","variance","std","spatio","coupling","compare","features","count","corr"}
     """
-    uq = user_q.lower()
+    uq = (user_q or "").lower().strip()
+    if not uq:
+        return None
 
     # 1) participants count
-    if any(w in uq for w in ["how many participants","πόσοι συμμετέχ","count subjects","πόσα άτομα"]):
+    if any(w in uq for w in ["how many participants","πόσοι συμμετέχ","count subjects","πόσα άτομα","how many asd","how many td"]):
         return cy_count_participants(), "count"
 
     # 2) list features
@@ -349,7 +325,7 @@ def intent_router(user_q: str) -> Optional[Tuple[str,str]]:
     if rgx:
         return cy_list_features(rgx), "features"
 
-    # 3) spatiotemporal intent
+    # 3) spatiotemporal
     sp = spatiotemporal_key(uq)
     if sp:
         cond = detect_condition(uq)
@@ -361,12 +337,11 @@ def intent_router(user_q: str) -> Optional[Tuple[str,str]]:
     if cp:
         cond = detect_condition(uq)
         side = detect_side(uq)
-        src, tgt = cp  # stems
+        src, tgt = cp
         return cy_coupling_ols(cond, side, src, tgt), "coupling"
 
-    # 5) correlation (pearson) between two joints if mentioned
+    # 5) correlation
     if "correl" in uq or "συσχε" in uq:
-        # try to pick any two joint mentions
         mentioned = [JOINT_MAP[k][0] for k in JOINT_MAP if k in uq]
         if len(mentioned) >= 2:
             cond = detect_condition(uq)
@@ -383,88 +358,63 @@ def intent_router(user_q: str) -> Optional[Tuple[str,str]]:
             return cy_mean_per_subject(cond, side, stem, nice, stat="variance"), "variance"
         if asks_std(uq):
             return cy_mean_per_subject(cond, side, stem, nice, stat="std"), "std"
-        # default → mean per subject
         return cy_mean_per_subject(cond, side, stem, nice, stat="mean"), "mean"
 
-    # 7) group comparison (ASD vs TD) if code-like explicit mention
+    # 7) group comparison by explicit code pattern
     m_code = re.search(r"(hian|knfo|spkn|thhti|thh|spel|shwr|elha)[lr]?", uq)
     if m_code and ("vs" in uq or "compare" in uq or "diff" in uq or "διαφορ" in uq):
         code = m_code.group(0).upper()
         return cy_compare_groups(code_pattern=code), "compare"
 
-    # 8) fallback: try SLM (NL2Cypher will also do its own fallback for simple knee/ankle queries)
+    # 8) fallback → SLM
     return None
 
 # ---------- Clinical explanation (plain prose) ----------
-
 def clinical_explanation(rows: List[Dict[str,Any]], tag: str) -> Optional[str]:
     if not rows: return None
-    # try to summarise briefly depending on tag + available columns
     cols = set(rows[0].keys())
 
     if tag in {"mean","variance","std"} and {"condition","side","mean_deg","n"}.issubset(cols):
-        # one or two rows per side/condition
         parts = []
-        grp = {}
         for r in rows:
-            grp.setdefault((r.get("condition"), r.get("side")), []).append(r)
-        for (cond,side), arr in grp.items():
-            m = arr[0]["mean_deg"]
-            n = arr[0]["n"]
-            stat_name = {"mean":"mean angle","variance":"angle variance","std":"angle std"}[tag]
-            parts.append(f"For {cond}, {('left' if side=='L' else 'right')} limb: "
-                         f"{stat_name} ≈ {m}°, based on ~{n} participants (per-subject means).")
+            limb = "left" if r.get("side")=="L" else "right"
+            stat_name = {"mean":"mean angle","variance":"angle variance","std":"angle SD"}[tag]
+            parts.append(f"{r.get('condition')}, {limb}: {stat_name} ≈ {r.get('mean_deg')}°, n≈{r.get('n')} (per-subject means).")
         return " ".join(parts)
 
     if tag == "spatio" and {"condition","mean_value","n"}.issubset(cols):
-        # assume ordered ASD,TD two rows
-        text = []
-        for r in rows:
-            text.append(f"{r['condition']}: mean ≈ {r['mean_value']} (n≈{r['n']}).")
-        return "Spatiotemporal summary — " + " ".join(text)
+        return " ".join(f"{r['condition']}: mean ≈ {r['mean_value']} (n≈{r['n']})." for r in rows)
 
     if tag == "coupling" and {"condition","side","beta","R2","n"}.issubset(cols):
-        pieces = []
+        bits = []
         for r in rows:
-            beta = r.get("beta"); r2 = r.get("R2"); n = r.get("n"); cond = r.get("condition"); side = r.get("side")
-            limb = "right" if side=="R" else "left"
-            pieces.append(f"{cond}, {limb}: slope β≈{beta} (Δtarget per 1° source), R²≈{r2}, n≈{n}.")
-        return ("Coupling (OLS across per-subject means). "
-                "Interpretation: β>1 ⇒ the target joint changes more than the source; "
-                "low R² (<0.2) suggests weak coupling or high between-subject variability. "
-                + " ".join(pieces))
+            limb = "right" if r["side"]=="R" else "left"
+            bits.append(f"{r['condition']}, {limb}: β≈{r['beta']}, R²≈{r['R2']}, n≈{r['n']}.")
+        return ("Coupling across per-subject means. β is the slope (target change per 1° change in source). "
+                "Higher β ⇒ stronger following; low R² (<0.2) ⇒ weak coupling/high variability. " + " ".join(bits))
 
     if tag == "compare" and {"condition","mean_value"}.issubset(cols):
-        # expect 2 rows ASD/TD
         d = {r["condition"]: r["mean_value"] for r in rows}
         if "ASD" in d and "TD" in d:
             diff = round(d["ASD"] - d["TD"], 3)
-            pct = round(100.0*diff/ d["TD"], 1) if d["TD"] else None
+            pct = (round(100.0*diff/d["TD"], 1) if d["TD"] else None)
             base = f"Group comparison (per-subject means). ASD ≈ {d['ASD']}, TD ≈ {d['TD']}, Δ≈{diff}"
-            if pct is not None:
-                base += f" ({pct}% vs TD)."
+            if pct is not None: base += f" ({pct}% vs TD)."
             return base
         return "Group comparison (per-subject means)."
 
     if tag == "corr" and {"condition","side","r","n"}.issubset(cols):
-        text = []
-        for r in rows:
-            side = "right" if r["side"]=="R" else "left"
-            text.append(f"{r['condition']}, {side}: Pearson r≈{r['r']} (n≈{r['n']}).")
-        return "Correlation across per-subject means. " + " ".join(text)
+        return " ".join(f"{r['condition']}, {'right' if r['side']=='R' else 'left'}: r≈{r['r']} (n≈{r['n']})." for r in rows)
 
     if tag == "count" and {"condition","participants"}.issubset(cols):
         return "Participants per group: " + ", ".join(f"{r['condition']}={r['participants']}" for r in rows)
 
-    # generic fallback
     if "n" in cols and "beta" in cols and "R2" in cols:
-        return ("Regression summary: β is the slope (target change per 1° source). "
-                "R² quantifies coupling strength (0–1). Higher β ⇒ stronger following; "
-                "very low R² suggests noise/variability.")
+        return ("Regression summary: β=slope (target per 1° source), R²=fit (0–1). "
+                "Higher β ⇒ stronger following; very low R² ⇒ noise/variability.")
     return None
 
 # ---------- NL → Cypher → Exec ----------
-
 st.subheader("❓ Ρώτησε σε φυσική γλώσσα")
 q = st.text_area(
     "Ερώτηση (GR/EN):",
@@ -473,13 +423,10 @@ q = st.text_area(
 )
 
 def generate_cypher(user_q: str) -> Tuple[str,str]:
-    # 1) Try rich rule-based router
     routed = intent_router(user_q)
     if routed:
         cy, tag = routed
         return cy, tag
-
-    # 2) Else use SLM (which internally also falls back for simple knee/ankle)
     cy = generator(user_q, synonyms, fewshots)
     return cy, "slm"
 
@@ -511,7 +458,7 @@ cy = st.session_state.get("last_cypher","")
 if show_cypher and cy:
     st.code(cy, language="cypher")
 
-# Show results + clinical explanation (flow text)
+# Show results + clinical explanation
 rows = st.session_state.get("last_rows", [])
 tag = st.session_state.get("last_tag","")
 if rows:
@@ -548,7 +495,7 @@ with qa3:
         if db:
             st.session_state["last_rows"] = db.run(st.session_state["last_cypher"])
 
-# (Optional) tiny ML demo kept as-is; toggle via sidebar
+# (Optional) tiny ML demo; toggle via sidebar
 if enable_ml:
     st.divider()
     st.subheader("🤖 Quick ML demo (optional)")
@@ -594,5 +541,4 @@ RETURN coalesce(k.value, null) AS knee,
                     from sklearn.linear_model import LinearRegression
                     m = LinearRegression().fit(X, y)
                     r2 = float(m.score(X, y))
-                    st.success(f"Linear R²={r2:.4f} (in-sample).")               
-                
+                    st.success(f"Linear R²={r2:.4f} (in-sample).")
