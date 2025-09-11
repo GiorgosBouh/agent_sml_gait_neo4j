@@ -226,22 +226,26 @@ WITH side, '{src_stem}' AS src_stem, '{tgt_stem}' AS tgt_stem
 MATCH (p:Subject)-[:HAS_CONDITION]->(c:Condition)
 {cond_filter}
 MATCH (p)-[:HAS_SAMPLE]->(s:Sample)
-// source X
+/* source X */
 MATCH (s)-[:HAS_VALUE]->(xv:FeatureValue)-[:OF_FEATURE]->(xf:Feature)
 WHERE xf.stat='mean' AND xf.code =~ ('(?i).*' + src_stem + side + '\\s*$')
-// target Y
+/* target Y */
 MATCH (s)-[:HAS_VALUE]->(yv:FeatureValue)-[:OF_FEATURE]->(yf:Feature)
 WHERE yf.stat='mean' AND yf.code =~ ('(?i).*' + tgt_stem + side + '\\s*$')
 WITH c.name AS condition, side, p.pid AS pid, avg(xv.value) AS X, avg(yv.value) AS Y
-WITH condition, side, collect(X) AS Xs, collect(Y) AS Ys
-WITH condition, side, Xs, Ys, size(Xs) AS n,
-     reduce(a=0.0, v IN Xs | a+v) AS sx,
-     reduce(a=0.0, v IN Ys | a+v) AS sy,
-     reduce(a=0.0, i IN range(0,n-1) | a + Xs[i]*Ys[i]) AS sxy,
-     reduce(a=0.0, i IN range(0,n-1) | a + Xs[i]*Xs[i]) AS sxx,
-     reduce(a=0.0, i IN range(0,n-1) | a + Ys[i]*Ys[i]) AS syy
+WITH condition, side, collect({{x:X, y:Y}}) AS pairs
+UNWIND pairs AS p
+WITH condition, side,
+     count(*) AS n,
+     sum(p.x) AS sx,
+     sum(p.y) AS sy,
+     sum(p.x*p.y) AS sxy,
+     sum(p.x*p.x) AS sxx,
+     sum(p.y*p.y) AS syy
 WITH condition, side, n, sx, sy, sxy, sxx, syy,
-     (n*sxx - sx*sx) AS denom, (n*sxy - sx*sy) AS num, (n*syy - sy*sy) AS Syy
+     (n*sxx - sx*sx) AS denom,
+     (n*sxy - sx*sy) AS num,
+     (n*syy - sy*sy) AS Syy
 RETURN condition, side, n,
        round(CASE WHEN denom<>0 THEN num/denom ELSE null END,4) AS beta,
        round(CASE WHEN denom>0 AND Syy>0 THEN (num*num)/(denom*Syy) ELSE null END,4) AS R2,
@@ -285,20 +289,22 @@ WITH side, '{a_stem}' AS a_stem, '{b_stem}' AS b_stem
 MATCH (p:Subject)-[:HAS_CONDITION]->(c:Condition)
 {cond_filter}
 MATCH (p)-[:HAS_SAMPLE]->(s:Sample)
-// A
+/* A */
 MATCH (s)-[:HAS_VALUE]->(av:FeatureValue)-[:OF_FEATURE]->(af:Feature)
 WHERE af.stat='mean' AND af.code =~ ('(?i).*' + a_stem + side + '\\s*$')
-// B
+/* B */
 MATCH (s)-[:HAS_VALUE]->(bv:FeatureValue)-[:OF_FEATURE]->(bf:Feature)
 WHERE bf.stat='mean' AND bf.code =~ ('(?i).*' + b_stem + side + '\\s*$')
 WITH c.name AS condition, side, p.pid AS pid, avg(av.value) AS A, avg(bv.value) AS B
-WITH condition, side, collect(A) AS As, collect(B) AS Bs
-WITH condition, side, As, Bs, size(As) AS n,
-     reduce(a=0.0, v IN As | a+v) AS sA,
-     reduce(a=0.0, v IN Bs | a+v) AS sB,
-     reduce(a=0.0, i IN range(0,n-1) | a + As[i]*Bs[i]) AS sAB,
-     reduce(a=0.0, i IN range(0,n-1) | a + As[i]*As[i]) AS sAA,
-     reduce(a=0.0, i IN range(0,n-1) | a + Bs[i]*Bs[i]) AS sBB
+WITH condition, side, collect({{a:A, b:B}}) AS pairs
+UNWIND pairs AS p
+WITH condition, side,
+     count(*) AS n,
+     sum(p.a) AS sA,
+     sum(p.b) AS sB,
+     sum(p.a*p.b) AS sAB,
+     sum(p.a*p.a) AS sAA,
+     sum(p.b*p.b) AS sBB
 WITH condition, side, n, sA, sB, sAB, sAA, sBB,
      (n*sAB - sA*sB) AS cov_num,
      sqrt( (n*sAA - sA*sA) * (n*sBB - sB*sB) ) AS cov_den
@@ -422,12 +428,31 @@ q = st.text_area(
     placeholder="Examples: 'mean knee angle right in ASD', 'ASD vs TD velocity', 'knee->ankle coupling left', 'list features like HIAN', 'participants count'"
 )
 
-def generate_cypher(user_q: str) -> Tuple[str,str]:
+def generate_cypher(user_q: str) -> Tuple[str, str]:
+    """
+    Returns (cypher, tag).
+
+    Order:
+      1) Rule-based intent router (fast, deterministic).
+      2) SLM (NL2Cypher) fallback.
+         If SLM output is empty/invalid (not starting with a Cypher keyword),
+         return a safe default query (mean right knee in ASD).
+    """
+    # 1) Rule-based
     routed = intent_router(user_q)
     if routed:
         cy, tag = routed
         return cy, tag
+
+    # 2) SLM fallback
     cy = generator(user_q, synonyms, fewshots)
+
+    # Validate SLM output looks like Cypher
+    is_valid = isinstance(cy, str) and bool(re.search(r'(?is)^\s*(MATCH|WITH|CALL|UNWIND|RETURN|CREATE|MERGE)\b', cy))
+    if not is_valid:
+        # Safe default: per-subject mean, ASD, Right knee (HIANR)
+        return cy_mean_per_subject("ASD", "R", "HIAN", "Knee", stat="mean"), "mean"
+
     return cy, "slm"
 
 colA, colB = st.columns([1,1])
