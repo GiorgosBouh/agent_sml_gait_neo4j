@@ -6,3 +6,8 @@ pandas>=2.2
 tqdm==4.66.5
 scikit-learn==1.5.1
 xgboost==2.1.1
+streamlit>=1.36
+requests>=2.32
+transformers>=4.41
+torch>=2.3
+sentencepiece
