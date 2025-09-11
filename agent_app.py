@@ -393,49 +393,156 @@ def intent_router(user_q: str) -> Optional[Tuple[str,str]]:
 
 # ---------- Clinical explanation (plain prose) ----------
 def clinical_explanation(rows: List[Dict[str,Any]], tag: str) -> Optional[str]:
-    if not rows: return None
+    """
+    Patient-friendly, plain-language explanations for all result types.
+    Works with the columns your queries already return.
+    """
+    if not rows:
+        return None
+
+    def cond_text(cond: str) -> str:
+        if cond == "ASD":
+            return "children with autism (ASD)"
+        if cond == "TD":
+            return "typically developing children (TD)"
+        return cond or "the group"
+
+    def side_text(side: Optional[str]) -> str:
+        if side == "L": return "on the left side"
+        if side == "R": return "on the right side"
+        return ""  # unknown / both
+
+    def beta_phrase(beta: Optional[float]) -> str:
+        if beta is None:
+            return "the ankle–knee link cannot be estimated"
+        b = float(beta)
+        if b < -0.2:
+            return "the ankle tends to move in the opposite direction to the knee"
+        if -0.2 <= b < 0.2:
+            return "the ankle hardly changes when the knee changes"
+        if 0.2 <= b < 0.8:
+            return "the ankle follows the knee a little"
+        if 0.8 <= b <= 1.2:
+            return "the ankle follows the knee roughly one-to-one"
+        return "the ankle moves more than the knee, as a compensation"
+
+    def r2_phrase(r2: Optional[float]) -> str:
+        if r2 is None:
+            return ""
+        r = float(r2)
+        if r < 0.2:   return "This link is weak and varies a lot between children."
+        if r < 0.5:   return "This link is moderate and shows some consistency."
+        return "This link is strong and fairly consistent."
+
+    def corr_phrase(r: Optional[float]) -> str:
+        if r is None:
+            return "No clear relationship can be estimated."
+        val = abs(float(r))
+        direction = "in the same direction" if float(r) >= 0 else "in opposite directions"
+        if val < 0.2:   strength = "little to no relationship"
+        elif val < 0.5: strength = "a modest relationship"
+        elif val < 0.7: strength = "a moderate relationship"
+        else:           strength = "a strong relationship"
+        return f"There is {strength} between the two measures, moving {direction}."
+
     cols = set(rows[0].keys())
 
+    # --- Mean / Variance / Std (angles per subject) ---
     if tag in {"mean","variance","std"} and {"condition","side","mean_deg","n"}.issubset(cols):
+        stat_name = {"mean":"average angle", "variance":"angle variability", "std":"angle spread (standard deviation)"}[tag]
+        sentences = []
+        for r in rows:
+            group = cond_text(r.get("condition"))
+            side = side_text(r.get("side"))
+            m = r.get("mean_deg")
+            n = r.get("n")
+            piece = f"For {group}{(', ' + side) if side else ''}, the {stat_name} is about {m}°, based on roughly {n} children."
+            sentences.append(piece)
+        return " ".join(sentences)
+
+    # --- Spatiotemporal means (e.g., Velocity, StaT, etc.) ---
+    if tag == "spatio" and {"condition","mean_value","n"}.issubset(cols):
+        sentences = []
+        for r in rows:
+            group = cond_text(r.get("condition"))
+            mv = r.get("mean_value")
+            n  = r.get("n")
+            sentences.append(f"For {group}, the average value is about {mv}, from around {n} children.")
+        return " ".join(sentences)
+
+    # --- Coupling / regression (β & R²) ---
+    if tag == "coupling" and {"condition","side","beta","R2","n"}.issubset(cols):
+        sentences = []
+        for r in rows:
+            group = cond_text(r.get("condition"))
+            side  = side_text(r.get("side"))
+            beta  = r.get("beta")
+            r2    = r.get("R2")
+            n     = r.get("n")
+            phr_b = beta_phrase(beta)
+            phr_r = r2_phrase(r2)
+            part1 = f"In {group}{(', ' + side) if side else ''}, when the knee moves, {phr_b}."
+            part2 = f" {phr_r}" if phr_r else ""
+            part3 = f" (about {n} children)." if n is not None else ""
+            sentences.append(part1 + part2 + part3)
+        return " ".join(sentences)
+
+    # --- Group comparison (ASD vs TD) ---
+    if tag == "compare" and {"condition","mean_value"}.issubset(cols):
+        # Expect two rows: ASD, TD (order can vary)
+        vals = {r["condition"]: r["mean_value"] for r in rows if r.get("condition") in {"ASD","TD"}}
+        if "ASD" in vals and "TD" in vals:
+            asd, td = vals["ASD"], vals["TD"]
+            diff = None
+            try:
+                diff = float(asd) - float(td)
+            except Exception:
+                pass
+            direction = ("higher" if diff is not None and diff > 0 else
+                         "lower" if diff is not None and diff < 0 else "about the same")
+            base = f"On average, children with autism (ASD) are {direction} than typically developing children (TD) on this measure."
+            if diff is not None and td not in (0, None):
+                try:
+                    pct = round(100.0 * diff / float(td), 1)
+                    base += f" The difference is about {abs(diff):g} units (~{abs(pct)}%)."
+                except Exception:
+                    base += f" The difference is about {abs(diff):g} units."
+            return base
+        # Fallback if only one group returned
+        sentences = []
+        for r in rows:
+            sentences.append(f"For {cond_text(r.get('condition'))}, the average is about {r.get('mean_value')}.")
+        return " ".join(sentences)
+
+    # --- Correlation (Pearson r) ---
+    if tag == "corr" and {"condition","side","r","n"}.issubset(cols):
+        sentences = []
+        for r in rows:
+            group = cond_text(r.get("condition"))
+            side  = side_text(r.get("side"))
+            phr   = corr_phrase(r.get("r"))
+            n     = r.get("n")
+            sentences.append(f"In {group}{(', ' + side) if side else ''}, {phr} (about {n} children).")
+        return " ".join(sentences)
+
+    # --- Counts (participants) ---
+    if tag == "count" and {"condition","participants"}.issubset(cols):
         parts = []
         for r in rows:
-            limb = "left" if r.get("side")=="L" else "right"
-            stat_name = {"mean":"mean angle","variance":"angle variance","std":"angle SD"}[tag]
-            parts.append(f"{r.get('condition')}, {limb}: {stat_name} ≈ {r.get('mean_deg')}°, n≈{r.get('n')} (per-subject means).")
-        return " ".join(parts)
+            parts.append(f"{cond_text(r['condition'])}: {r['participants']} children")
+        return "Participants by group — " + "; ".join(parts) + "."
 
-    if tag == "spatio" and {"condition","mean_value","n"}.issubset(cols):
-        return " ".join(f"{r['condition']}: mean ≈ {r['mean_value']} (n≈{r['n']})." for r in rows)
+    # --- Generic regression fallback ---
+    if {"n","beta","R2"}.issubset(cols):
+        # Use first row for a compact message
+        r = rows[0]
+        return ("When one joint moves, we estimate how much another joint tends to move with it. "
+                "A larger value means it follows more; a very small fit value means it varies a lot across children.")
 
-    if tag == "coupling" and {"condition","side","beta","R2","n"}.issubset(cols):
-        bits = []
-        for r in rows:
-            limb = "right" if r["side"]=="R" else "left"
-            bits.append(f"{r['condition']}, {limb}: β≈{r['beta']}, R²≈{r['R2']}, n≈{r['n']}.")
-        return ("Coupling across per-subject means. β is the slope (target change per 1° change in source). "
-                "Higher β ⇒ stronger following; low R² (<0.2) ⇒ weak coupling/high variability. " + " ".join(bits))
-
-    if tag == "compare" and {"condition","mean_value"}.issubset(cols):
-        d = {r["condition"]: r["mean_value"] for r in rows}
-        if "ASD" in d and "TD" in d:
-            diff = round(d["ASD"] - d["TD"], 3)
-            pct = (round(100.0*diff/d["TD"], 1) if d["TD"] else None)
-            base = f"Group comparison (per-subject means). ASD ≈ {d['ASD']}, TD ≈ {d['TD']}, Δ≈{diff}"
-            if pct is not None: base += f" ({pct}% vs TD)."
-            return base
-        return "Group comparison (per-subject means)."
-
-    if tag == "corr" and {"condition","side","r","n"}.issubset(cols):
-        return " ".join(f"{r['condition']}, {'right' if r['side']=='R' else 'left'}: r≈{r['r']} (n≈{r['n']})." for r in rows)
-
-    if tag == "count" and {"condition","participants"}.issubset(cols):
-        return "Participants per group: " + ", ".join(f"{r['condition']}={r['participants']}" for r in rows)
-
-    if "n" in cols and "beta" in cols and "R2" in cols:
-        return ("Regression summary: β=slope (target per 1° source), R²=fit (0–1). "
-                "Higher β ⇒ stronger following; very low R² ⇒ noise/variability.")
+    # If none of the above matched, return nothing
     return None
 
+    
 # ---------- NL → Cypher → Exec ----------
 st.subheader("❓ Ρώτησε σε φυσική γλώσσα")
 q = st.text_area(
