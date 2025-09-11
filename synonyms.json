@@ -28,5 +28,10 @@
   "stance": "StaT",
   "swing": "SwiT",
   "κύκλος": "GaCT",
-  "ταχύτητα": "Velocity"
+  "ταχύτητα": "Velocity",
+  "thorax": "thorax",
+  "θωρακας": "thorax",
+  "θωρακικος": "thorax",
+  "στηθος": "thorax",
+  "chest": "thorax"
 }

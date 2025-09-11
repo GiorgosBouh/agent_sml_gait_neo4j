@@ -201,11 +201,11 @@ class NL2Cypher:
             return cy
 
         # 3) Heuristic very-shortcuts (π.χ. mean knee ASD με έτοιμο fewshot)
-        if re.search(r"(?i)\bmean\b.*\bHIAN", nq) and re.search(r"(?i)\bASD\b", nq):
-            for ex in fewshots or []:
-                c = ex.get("cypher","")
-                if "HIAN" in c and "ASD" in c:
-                    return c
+        #if re.search(r"(?i)\bmean\b.*\bHIAN", nq) and re.search(r"(?i)\bASD\b", nq):
+            #for ex in fewshots or []:
+               # c = ex.get("cypher","")
+                #if "HIAN" in c and "ASD" in c:
+                    #return c
 
         # 4) LLM fallback (strict sanitize)
         cy = self._llm_fallback(nq, fewshots)

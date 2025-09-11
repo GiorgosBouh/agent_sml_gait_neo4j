@@ -114,6 +114,11 @@ JOINT_MAP = {
     "shoulder": ("SHWR","Shoulder"),
     "elbow":  ("ELHA", "Elbow"),
     "αγκων":  ("ELHA", "Elbow"),
+    "thorax":  ("THHTI","Thorax"),
+    "θωρακ":   ("THHTI","Thorax"),
+    "θωρακα":  ("THHTI","Thorax"),
+    "στήθος":  ("THHTI","Thorax"),
+    "chest":   ("THHTI","Thorax"),
 }
 
 SPATIOTEMPORAL = {
@@ -127,9 +132,16 @@ SPATIOTEMPORAL = {
 }
 
 def detect_condition(uq: str) -> str:
-    if re.search(r"\b(asd|αυτισ)\b", uq): return "ASD"
-    if re.search(r"\b(td|typical|τυπικ)\b", uq): return "TD"
-    if re.search(r"(asd\s*vs\s*td|td\s*vs\s*asd|compare|diff|διαφορ)", uq): return "BOTH"
+    # explicit two-group intents (and/&/, in any order)
+    if re.search(r'\basd\b.*(?:and|&|,)\s*(?:td|typical)\b', uq) or \
+       re.search(r'\b(?:td|typical)\b.*(?:and|&|,)\s*asd\b', uq):
+        return "BOTH"
+    # vs/compare
+    if re.search(r'(asd\s*vs\s*td|td\s*vs\s*asd|compare|diff|διαφορ)', uq):
+        return "BOTH"
+    # single-group fallbacks
+    if re.search(r'\basd\b|αυτισ', uq): return "ASD"
+    if re.search(r'\btd\b|typical|τυπικ', uq): return "TD"
     return "ASD"
 
 def detect_side(uq: str) -> str:
@@ -186,9 +198,13 @@ def feature_regex_from_text(uq: str) -> Optional[str]:
 def cy_mean_per_subject(cond: str, side: str, joint_stem: str, joint_name: str, stat="mean") -> str:
     if side == "BOTH":
         side_filter = f"(f.code =~ '(?i).*{joint_stem}L\\s*$' OR f.code =~ '(?i).*{joint_stem}R\\s*$')"
+        side_expr   = "CASE WHEN f.code =~ '(?i).*L\\s*$' THEN 'L' ELSE 'R' END"
     else:
         side_filter = f"f.code =~ '(?i).*{joint_stem}{side}\\s*$'"
+        side_expr   = f"'{side}'"
+
     cond_filter = "" if cond == "BOTH" else f"WHERE c.name='{cond}'"
+
     return f"""
 MATCH (p:Subject)-[:HAS_CONDITION]->(c:Condition)
 {cond_filter}
@@ -196,7 +212,7 @@ MATCH (p)-[:HAS_SAMPLE]->(s:Sample)
 MATCH (s)-[:HAS_VALUE]->(fv:FeatureValue)-[:OF_FEATURE]->(f:Feature)
 WHERE f.stat='{stat}' AND {side_filter}
 WITH c.name AS condition,
-     CASE WHEN f.code =~ '(?i).*L\\s*$' THEN 'L' ELSE 'R' END AS side,
+     {side_expr} AS side,
      p.pid AS pid, avg(fv.value) AS subj_mean
 RETURN condition, side, round(avg(subj_mean),2) AS mean_deg, count(*) AS n
 ORDER BY condition, side
