@@ -594,4 +594,5 @@ RETURN coalesce(k.value, null) AS knee,
                     from sklearn.linear_model import LinearRegression
                     m = LinearRegression().fit(X, y)
                     r2 = float(m.score(X, y))
-                    st.success(f"Linear R²={r2:.4f} (in-sample).")                st.success(f"Linear R²={r2:.4f} (in-sample).")
+                    st.success(f"Linear R²={r2:.4f} (in-sample).")               
+                
