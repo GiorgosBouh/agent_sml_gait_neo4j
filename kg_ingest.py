@@ -81,15 +81,17 @@ MERGE (fv)-[:OF_FEATURE]->(f)
 FEATURE_META_1 = """
 MATCH (f:Feature)
 SET f.stat = CASE
-  WHEN f.code STARTS WITH 'mean ' THEN 'mean'
-  WHEN f.code STARTS WITH 'variance ' THEN 'variance'
-  WHEN f.code STARTS WITH 'std ' THEN 'std'
+  WHEN f.code =~ '^(?i)mean[-\\s].*' THEN 'mean'
+  WHEN f.code =~ '^(?i)variance[-\\s].*' THEN 'variance'
+  WHEN f.code =~ '^(?i)std[-\\s].*' THEN 'std'
   ELSE f.stat END
 """
 
 FEATURE_META_2 = """
 MATCH (f:Feature)
 SET f.side = CASE
+  WHEN f.code =~ '(?i).*Left$'  THEN 'L'
+  WHEN f.code =~ '(?i).*Right$' THEN 'R'
   WHEN f.code =~ '.*[A-Z]{3,}L$' THEN 'L'
   WHEN f.code =~ '.*[A-Z]{3,}R$' THEN 'R'
   ELSE coalesce(f.side,'NA') END,
@@ -103,8 +105,8 @@ SET f.side = CASE
 FEATURE_META_3 = """
 MATCH (f:Feature)
 SET f.family = CASE
-  WHEN f.code =~ '(?i)^(mean|variance|std)\\s+(HES|SPE|SHW|ELH|THH|SPK|HIA|KNF).*' THEN 'angle'
-  WHEN f.code =~ '(?i)^(mean|variance|std)-[xyz]-.*' THEN 'coord'
+  // Τα δικά σου mean/std/variance με άξονα+άρθρωση είναι coordinates
+  WHEN f.code =~ '(?i)^(mean|variance|std)[-\\s].*' AND f.code =~ '(?i).*(Knee|Ankle|Hip|Spine|Pelvis|Midspain|Midspine|Thigh|Shank|Foot)(Left|Right)?$' THEN 'coord'
   WHEN f.code IN ['StrLe','MaxStLe','MaxStWi','GaCT','StaT','SwiT','Velocity'] THEN 'spatiotemporal'
   WHEN f.code IN ['HaTiLPos','HaTiRPos'] THEN 'binary'
   WHEN f.code STARTS WITH 'Rom' THEN 'rom'
@@ -114,7 +116,6 @@ SET f.family = CASE
 FEATURE_META_4 = """
 MATCH (f:Feature)
 SET f.unit = CASE
-  WHEN f.family='angle' THEN 'deg'
   WHEN f.family='coord' THEN CASE WHEN f.stat='variance' THEN 'm2' ELSE 'm' END
   WHEN f.family='spatiotemporal' AND f.code='Velocity' THEN 'm/s'
   WHEN f.family='spatiotemporal' AND f.code<>'Velocity' THEN 'ms'
@@ -124,13 +125,12 @@ SET f.unit = CASE
 """
 
 FEATURE_META_5 = """
-MATCH (f:Feature) WHERE f.family='angle'
-SET f.plane = coalesce(f.plane,'Sagittal')
+MATCH (f:Feature)
 WITH f,
 CASE
-  WHEN f.code =~ '(?i).*HIAN(L|R).*' THEN 'Knee'
-  WHEN f.code =~ '(?i).*KNFO(L|R).*' THEN 'Ankle'
-  WHEN f.code =~ '(?i).*SPKN(L|R).*' THEN 'Hip'
+  WHEN f.code =~ '(?i).*Knee.*'  THEN 'Knee'
+  WHEN f.code =~ '(?i).*Ankle.*' THEN 'Ankle'
+  WHEN f.code =~ '(?i).*Hip.*'   THEN 'Hip'
   ELSE null END AS jname
 FOREACH (_ IN CASE WHEN jname IS NULL THEN [] ELSE [1] END |
   MERGE (j:Joint {name:jname})
@@ -207,7 +207,6 @@ def main():
 
             # Create Subjects once (distinct pid) and link to Condition (per pid majority or first row)
             log.info("Creating Subject nodes ...")
-            # Take first class per pid (dataset grouped by 8 makes it consistent)
             first_by_pid = df.groupby("pid").first(numeric_only=False)
             for pid, row in tqdm(first_by_pid.iterrows(), total=len(first_by_pid), desc="Subjects"):
                 run(sess, CREATE_SUBJECT, {"pid": int(pid), "cname": row["cname"]}).consume()
@@ -238,19 +237,28 @@ def main():
                     sample_id = f"{r['pid']}-{int(r['trial_idx'])}-{int(r['lineNo'])}"
                     for code in feature_cols:
                         v = r[code]
-                        if pd.isna(v) or v == "":
-                            continue
-                        try:
+                        # ---- robust numeric coercion (handles decimal comma) ----
+                        val = None
+                        if pd.isna(v):
+                            pass
+                        elif isinstance(v, (int, float)):
                             val = float(v)
-                        except Exception:
-                            continue
-                        value_params.append({"sample_id": sample_id, "code": code, "value": val})
+                        else:
+                            s = str(v).strip()
+                            if s != "":
+                                s = s.replace(",", ".")
+                                if s.lower() not in ("nan", "none", "null"):
+                                    try:
+                                        val = float(s)
+                                    except Exception:
+                                        val = None
+                        if val is not None:
+                            value_params.append({"sample_id": sample_id, "code": code, "value": val})
 
                 # Commit values in sub-batches to avoid huge transactions
                 step = 5000
                 for i in range(0, len(value_params), step):
                     sub = value_params[i:i+step]
-                    # Use explicit transaction for speed
                     with sess.begin_transaction() as tx:
                         for vp in sub:
                             tx.run(CREATE_VALUE_REL, vp)
