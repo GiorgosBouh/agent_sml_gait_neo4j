@@ -1,1 +1,8 @@
-Readme
+# NeuroGait Agent — NL ↔ Cypher (ASD/TD)
+
+Agent σε **Streamlit** που μετατρέπει **φυσική γλώσσα** σε **Cypher** (και εκτελεί στο Neo4j) με **δωρεάν small LLM** (HuggingFace `google/flan-t5-small`). Περιλαμβάνει few-shots, λεξικό συνωνύμων και demo ML (XGBoost/Linear).
+
+## Setup
+```bash
+python3 -m venv venv && source venv/bin/activate
+pip install -r requirements.txt
