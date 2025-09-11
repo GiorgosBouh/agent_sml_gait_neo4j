@@ -21,7 +21,7 @@ Usage:
 
 Requires:
   - Neo4j 5.x
-  - APOC (Core) enabled
+  - APOC (Core) enabled (and neo4j.conf: apoc.import.file.enabled=true, apoc.import.web.allow=true)
 """
 
 import argparse
@@ -207,6 +207,11 @@ def get_args():
 def run(session, query, params=None):
     return session.run(query, params or {}).data()
 
+def run_multi(session, block, params=None):
+    """Execute a block of multiple Cypher statements one-by-one."""
+    for stmt in [s.strip() for s in block.split(";") if s.strip()]:
+        session.run(stmt, params or {}).consume()
+
 def main():
     args = get_args()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(message)s")
@@ -217,10 +222,10 @@ def main():
     try:
         with driver.session() as sess:
             log.info("Creating constraints / indexes ...")
-            run(sess, CONSTRAINTS)
+            run_multi(sess, CONSTRAINTS)
 
             log.info("Seeding base nodes (Condition, Dataset) ...")
-            run(sess, SEED_NODES, {"dataset_name": args.dataset_name, "csv": args.csv})
+            run_multi(sess, SEED_NODES, {"dataset_name": args.dataset_name, "csv": args.csv})
 
             if not args.skip_ingest:
                 log.info("Ingesting CSV -> Graph (APOC) ...")
@@ -233,7 +238,7 @@ def main():
                 })
 
                 log.info("Enriching Feature metadata (stat/side/axis/family/plane/joint_guess + Joint links) ...")
-                run(sess, FEATURE_METADATA)
+                run_multi(sess, FEATURE_METADATA)
 
             log.info("Running quick checks ...")
             for name, q in CHECKS.items():
