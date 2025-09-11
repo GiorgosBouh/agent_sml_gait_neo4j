@@ -1,13 +1,22 @@
-neo4j>=5.19
+neo4j>=5.15
 python-dotenv>=1.0
 tqdm>=4.66
 tenacity>=8.2
 pandas>=2.2
-tqdm==4.66.5
+tqdm==4.66
 scikit-learn==1.5.1
 xgboost==2.1.1
+<<<<<<< HEAD
+tabulate>=0.9
+transformers>=4.41
+sentencepiece
+accelerate>=0.28
+streamlit>=1.36
+
+=======
 streamlit>=1.36
 requests>=2.32
 transformers>=4.41
 torch>=2.3
 sentencepiece
+>>>>>>> 957044e280d32c770bcafccd66e3a8a145412f9c
