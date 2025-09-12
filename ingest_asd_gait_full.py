@@ -2,23 +2,26 @@
 # -*- coding: utf-8 -*-
 
 """
-ASD & Typical Gait Knowledge Graph Ingestion (STRICT + SID + PROGRESS)
-----------------------------------------------------------------------
+ASD & Typical Gait Knowledge Graph Ingestion (STRICT + SID + PROGRESS + pid_num)
+---------------------------------------------------------------------------------
 Graph:
-  (:Subject {sid, pid, group})
+  (:Subject {sid, pid, pid_num, group})
       └─[:HAS_TRIAL]→ (:Trial {uid, trial_id, path})
             ├─[:HAS_FILE {kind}]→ (:File {uid, kind, path})
             └─[:HAS_FEATURE]→ (:FeatureValue {value})
                                 └─[:OF_FEATURE]→ (:Feature {code, stat})
 
-- Subjects are unique by `sid = "<group>:<pid>"` to avoid merging ASD/TD with same pid.
-- Scans only:
+Κύριες αρχές:
+- Subjects γίνονται MERGE με `sid = "<group>:<pid>"`.
+- Για συμβατότητα με υπάρχον unique constraint στο `Subject.pid`, το `pid` γράφεται = `sid`.
+- Προστίθεται `pid_num` (int) για τον αριθμητικό κωδικό συμμετέχοντα.
+- Σκανάρονται ΜΟΝΟ:
     ASD:    Dataset/Autism/children with ASD/<digit>
     Typical:Dataset/Typical/<digit>
-- Trials only inside: augmentation/* and video/*
-- Correlations between features (Spearman/Pearson) with thresholds from env.
+- Trials μόνο μέσα σε: augmentation/* και video/*
+- Correlations (Spearman/Pearson) με thresholds από env.
 
-Env (.env next to script or OS env):
+Env (.env δίπλα στο script ή OS env):
   NEO4J_URI=bolt://localhost:7687
   NEO4J_USER=neo4j
   NEO4J_PASSWORD=palatiou
@@ -96,14 +99,46 @@ def read_features_xlsx(x: Path) -> pd.DataFrame:
         log(f"[WARN] Failed to read {x}: {e}")
         return pd.DataFrame()
 
+# ---------------- Constraints helper (idempotent) ----------------
+def ensure_constraints():
+    cypher = """
+    CREATE CONSTRAINT subject_sid IF NOT EXISTS
+    FOR (s:Subject) REQUIRE s.sid IS UNIQUE;
+
+    CREATE CONSTRAINT trial_uid IF NOT EXISTS
+    FOR (t:Trial) REQUIRE t.uid IS UNIQUE;
+
+    CREATE CONSTRAINT file_uid IF NOT EXISTS
+    FOR (f:File) REQUIRE f.uid IS UNIQUE;
+
+    CREATE INDEX feature_code IF NOT EXISTS
+    FOR (f:Feature) ON (f.code);
+    """
+    with driver.session() as s:
+        for stmt in [x.strip() for x in cypher.strip().split(";") if x.strip()]:
+            s.run(stmt)
+
 # ---------------- Neo4j transactions ----------------
 def upsert_subject_tx(tx, pid: str, group: str):
+    # Make sid unique and pid compatible with old unique constraint on pid
     sid = f"{group}:{pid}"
+    # Try to derive numeric pid (pid_num); if not int, leave None
+    try:
+        pid_num = int(pid)
+    except Exception:
+        pid_num = None
+
     tx.run("""
         MERGE (s:Subject {sid:$sid})
-        ON CREATE SET s.pid=$pid, s.group=$group, s.createdAt=timestamp()
-        ON MATCH  SET s.group=coalesce(s.group,$group)
-    """, sid=sid, pid=pid, group=group)
+        ON CREATE SET
+            s.pid       = $sid,     // keep legacy unique(pid) happy
+            s.pid_num   = $pid_num, // numeric id kept separately
+            s.group     = $group,
+            s.createdAt = timestamp()
+        ON MATCH SET
+            s.group     = coalesce(s.group,$group),
+            s.pid_num   = coalesce(s.pid_num,$pid_num)
+    """, sid=sid, pid_num=pid_num, group=group)
 
 def create_trial_tx(tx, pid: str, group: str, trial_id: str, trial_path: str, t_uid: str):
     sid = f"{group}:{pid}"
@@ -176,11 +211,11 @@ def scan_and_ingest(root: Path) -> List[Tuple[str, str, float]]:
     for k, (group, pid, pdir) in enumerate(parts, 1):
         log(f"[{k}/{total}] Subject pid={pid} group={group}")
 
-        # 1) Subject
+        # 0) Ensure Subject exists
         with driver.session() as sess:
             sess.execute_write(upsert_subject_tx, pid, group)
 
-        # 2) Trials: only under augmentation/* and video/*
+        # 1) Collect trial directories only under augmentation/* and video/*
         cand_dirs: List[Path] = []
         for sub in ("augmentation", "video"):
             base = pdir / sub
@@ -300,6 +335,9 @@ if __name__ == "__main__":
     if ONLY_CORR:
         print("[WARN] ONLY_CORR=1 not implemented to pull from DB; run full ingest.", flush=True)
         sys.exit(0)
+
+    # Ensure constraints we depend on (idempotent)
+    ensure_constraints()
 
     observations = scan_and_ingest(ROOT)
     print(f"[INFO] Observations collected: {len(observations)}", flush=True)
