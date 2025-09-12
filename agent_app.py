@@ -465,6 +465,7 @@ def clinical_explanation(rows: List[Dict[str,Any]], tag: str) -> Optional[str]:
     # Fallbacks…
     return None
 
+
 # ---------- NL → Cypher → Exec ----------
 st.subheader("❓ Ρώτησε σε φυσική γλώσσα")
 q = st.text_area(
