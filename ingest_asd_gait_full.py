@@ -2,15 +2,23 @@
 # -*- coding: utf-8 -*-
 
 """
-ASD & Typical Gait Knowledge Graph Ingestion (STRICT + PROGRESS)
-- ΜΟΝΟ participants:
+ASD & Typical Gait Knowledge Graph Ingestion (STRICT + SID + PROGRESS)
+----------------------------------------------------------------------
+Graph:
+  (:Subject {sid, pid, group})
+      └─[:HAS_TRIAL]→ (:Trial {uid, trial_id, path})
+            ├─[:HAS_FILE {kind}]→ (:File {uid, kind, path})
+            └─[:HAS_FEATURE]→ (:FeatureValue {value})
+                                └─[:OF_FEATURE]→ (:Feature {code, stat})
+
+- Subjects are unique by `sid = "<group>:<pid>"` to avoid merging ASD/TD with same pid.
+- Scans only:
     ASD:    Dataset/Autism/children with ASD/<digit>
     Typical:Dataset/Typical/<digit>
-- Trials ΜΟΝΟ μέσα σε: augmentation/* και video/*
-- Progress prints για να βλέπεις εξέλιξη
-- Correlation layer προαιρετικό μέσω thresholds στο .env
+- Trials only inside: augmentation/* and video/*
+- Correlations between features (Spearman/Pearson) with thresholds from env.
 
-Env (.env ή inline):
+Env (.env next to script or OS env):
   NEO4J_URI=bolt://localhost:7687
   NEO4J_USER=neo4j
   NEO4J_PASSWORD=palatiou
@@ -18,9 +26,14 @@ Env (.env ή inline):
   CORR_METHOD=spearman
   CORR_MIN_ABS_R=0.7
   CORR_MIN_PAIRS=20
+  VERBOSE=1
+  SKIP_FEATURES=0
+  ONLY_CORR=0
 """
 
-import os, sys, hashlib
+import os
+import sys
+import hashlib
 from pathlib import Path
 from typing import Dict, List, Tuple
 import pandas as pd
@@ -28,23 +41,24 @@ import numpy as np
 from neo4j import GraphDatabase
 from dotenv import load_dotenv
 
-# -------- load env explicitly next to script (fallback: cwd) --------
+# ---------- load .env explicitly (script dir) and also allow OS env ----------
 HERE = Path(__file__).resolve().parent
 load_dotenv(dotenv_path=HERE / ".env", override=False)
-load_dotenv(override=False)  # also allow inline env / cwd
+load_dotenv(override=False)  # also pick up OS env vars
 
+# ---------- config ----------
 ROOT = Path(os.getenv("DATASET_ROOT", "./Dataset")).expanduser()
 NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
 NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
 NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "neo4j")
 
 CORR_METHOD = os.getenv("CORR_METHOD", "spearman").strip().lower()
-if CORR_METHOD not in {"pearson", "spearman"}: CORR_METHOD = "spearman"
+if CORR_METHOD not in {"pearson", "spearman"}:
+    CORR_METHOD = "spearman"
 CORR_MIN_ABS_R = float(os.getenv("CORR_MIN_ABS_R", "0.7"))
 CORR_MIN_PAIRS = int(os.getenv("CORR_MIN_PAIRS", "20"))
 
-# Optional controls
-VERBOSE = os.getenv("VERBOSE", "1") == "1"  # default on (prints progress)
+VERBOSE = os.getenv("VERBOSE", "1") == "1"         # default verbose on
 SKIP_FEATURES = os.getenv("SKIP_FEATURES", "0") == "1"
 ONLY_CORR = os.getenv("ONLY_CORR", "0") == "1"
 
@@ -55,6 +69,7 @@ def log(msg: str):
         print(msg, flush=True)
 
 def uid(*parts) -> str:
+    """Stable SHA1 UID from multiple parts."""
     m = hashlib.sha1()
     for p in parts:
         m.update(str(p).encode("utf-8"))
@@ -62,6 +77,7 @@ def uid(*parts) -> str:
     return m.hexdigest()
 
 def is_trial_dir(p: Path) -> bool:
+    """A directory is a trial if it contains at least one expected file type."""
     try:
         names = [n.lower() for n in os.listdir(p)]
     except Exception:
@@ -71,6 +87,7 @@ def is_trial_dir(p: Path) -> bool:
            any(n.endswith(".avi") for n in names)
 
 def read_features_xlsx(x: Path) -> pd.DataFrame:
+    """Read features.xlsx robustly; return empty DataFrame on error."""
     try:
         df = pd.read_excel(x)
         df.columns = [str(c).strip() for c in df.columns]
@@ -79,41 +96,45 @@ def read_features_xlsx(x: Path) -> pd.DataFrame:
         log(f"[WARN] Failed to read {x}: {e}")
         return pd.DataFrame()
 
-# --------------- Neo4j TX ---------------
+# ---------------- Neo4j transactions ----------------
 def upsert_subject_tx(tx, pid: str, group: str):
+    sid = f"{group}:{pid}"
     tx.run("""
-        MERGE (s:Subject {pid:$pid})
-        ON CREATE SET s.group=$group, s.createdAt=timestamp()
+        MERGE (s:Subject {sid:$sid})
+        ON CREATE SET s.pid=$pid, s.group=$group, s.createdAt=timestamp()
         ON MATCH  SET s.group=coalesce(s.group,$group)
-    """, pid=pid, group=group)
+    """, sid=sid, pid=pid, group=group)
 
-def create_trial_tx(tx, pid: str, trial_id: str, trial_path: str, t_uid: str):
+def create_trial_tx(tx, pid: str, group: str, trial_id: str, trial_path: str, t_uid: str):
+    sid = f"{group}:{pid}"
     tx.run("""
-        MATCH (s:Subject {pid:$pid})
+        MATCH (s:Subject {sid:$sid})
         MERGE (t:Trial {uid:$t_uid})
           ON CREATE SET t.trial_id=$trial_id, t.path=$trial_path, t.createdAt=timestamp()
         MERGE (s)-[:HAS_TRIAL]->(t)
-    """, pid=pid, t_uid=t_uid, trial_id=trial_id, trial_path=str(trial_path))
+    """, sid=sid, t_uid=t_uid, trial_id=trial_id, trial_path=str(trial_path))
 
-def attach_files_batch_tx(tx, pid: str, trial_id: str, rows: List[Dict]):
+def attach_files_batch_tx(tx, pid: str, group: str, trial_id: str, rows: List[Dict]):
+    sid = f"{group}:{pid}"
     tx.run("""
         UNWIND $rows AS r
-        MATCH (s:Subject {pid:$pid})-[:HAS_TRIAL]->(t:Trial {trial_id:$trial_id})
+        MATCH (s:Subject {sid:$sid})-[:HAS_TRIAL]->(t:Trial {trial_id:$trial_id})
         MERGE (f:File {uid:r.f_uid})
           ON CREATE SET f.kind=r.kind, f.path=r.path, f.createdAt=timestamp()
         MERGE (t)-[:HAS_FILE {kind:r.kind}]->(f)
-    """, pid=pid, trial_id=trial_id, rows=rows)
+    """, sid=sid, trial_id=trial_id, rows=rows)
 
-def attach_features_tx(tx, pid: str, trial_id: str, rows: List[Dict]):
+def attach_features_tx(tx, pid: str, group: str, trial_id: str, rows: List[Dict]):
+    sid = f"{group}:{pid}"
     tx.run("""
         UNWIND $rows AS row
-        MATCH (s:Subject {pid:$pid})-[:HAS_TRIAL]->(t:Trial {trial_id:$trial_id})
+        MATCH (s:Subject {sid:$sid})-[:HAS_TRIAL]->(t:Trial {trial_id:$trial_id})
         MERGE (f:Feature {code:row.code})
           ON CREATE SET f.stat=row.stat
         CREATE (fv:FeatureValue {value:row.value})
         MERGE (t)-[:HAS_FEATURE]->(fv)
         MERGE (fv)-[:OF_FEATURE]->(f)
-    """, pid=pid, trial_id=trial_id, rows=rows)
+    """, sid=sid, trial_id=trial_id, rows=rows)
 
 def upsert_feature_correlation_tx(tx, a: str, b: str, r: float, n: int,
                                   method: str, min_abs: float, min_pairs: int):
@@ -129,15 +150,15 @@ def upsert_feature_correlation_tx(tx, a: str, b: str, r: float, n: int,
     """, a=a, b=b, r=float(r), n=int(n), method=method,
          min_abs=float(min_abs), min_pairs=int(min_pairs))
 
-# --------------- Scanner ---------------
+# ---------------- Scanner ----------------
 def iter_participants(root: Path):
+    """Yield tuples (group, pid, participant_dir) for strict folders only."""
     # ASD
     asd_root = root / "Autism" / "children with ASD"
     if asd_root.exists():
         for d in sorted(asd_root.iterdir(), key=lambda p: (not p.name.isdigit(), p.name)):
             if d.is_dir() and d.name.isdigit():
                 yield ("ASD", d.name, d)
-
     # TD
     td_root = root / "Typical"
     if td_root.exists():
@@ -146,6 +167,7 @@ def iter_participants(root: Path):
                 yield ("TD", d.name, d)
 
 def scan_and_ingest(root: Path) -> List[Tuple[str, str, float]]:
+    """Scan dataset, ingest graph, and return (trial_uid, feature_code, value) observations."""
     observations: List[Tuple[str, str, float]] = []
     parts = list(iter_participants(root))
     total = len(parts)
@@ -154,11 +176,11 @@ def scan_and_ingest(root: Path) -> List[Tuple[str, str, float]]:
     for k, (group, pid, pdir) in enumerate(parts, 1):
         log(f"[{k}/{total}] Subject pid={pid} group={group}")
 
-        # Subject
+        # 1) Subject
         with driver.session() as sess:
             sess.execute_write(upsert_subject_tx, pid, group)
 
-        # Candidate trial dirs only under augmentation/* and video/*
+        # 2) Trials: only under augmentation/* and video/*
         cand_dirs: List[Path] = []
         for sub in ("augmentation", "video"):
             base = pdir / sub
@@ -170,17 +192,17 @@ def scan_and_ingest(root: Path) -> List[Tuple[str, str, float]]:
 
         for tdir in trials:
             trial_id = tdir.name
-            t_uid = uid(pid, trial_id, tdir)
+            t_uid = uid(pid, group, trial_id, tdir)
 
             with driver.session() as sess:
-                sess.execute_write(create_trial_tx, pid, trial_id, str(tdir), t_uid)
+                sess.execute_write(create_trial_tx, pid, group, trial_id, str(tdir), t_uid)
 
-            # Batch files
-            files_rows = []
-            feature_rows = []
+            files_rows: List[Dict] = []
+            feature_rows: List[Dict] = []
 
             for f in tdir.iterdir():
-                if not f.is_file(): continue
+                if not f.is_file():
+                    continue
                 fn = f.name.lower()
                 kind = None
                 if fn.endswith("_2d.xlsx"): kind = "2d"
@@ -189,74 +211,93 @@ def scan_and_ingest(root: Path) -> List[Tuple[str, str, float]]:
                 elif fn.endswith(".xlsx"): kind = "raw"
 
                 if kind:
-                    files_rows.append({"f_uid": uid(pid, trial_id, str(f), kind),
-                                       "kind": kind, "path": str(f)})
+                    files_rows.append({
+                        "f_uid": uid(pid, group, trial_id, str(f), kind),
+                        "kind": kind,
+                        "path": str(f)
+                    })
 
                 if (not SKIP_FEATURES) and fn.endswith("features.xlsx"):
                     df = read_features_xlsx(f)
-                    if df.empty: continue
+                    if df.empty:
+                        continue
                     if "code" in df.columns and "value" in df.columns:
                         for _, r in df.iterrows():
                             code = str(r.get("code") or "").strip()
-                            if not code: continue
-                            try: val = float(r.get("value"))
-                            except: continue
+                            if not code:
+                                continue
+                            try:
+                                val = float(r.get("value"))
+                            except Exception:
+                                continue
                             stat = str(r.get("stat", "value"))
                             feature_rows.append({"code": code, "value": val, "stat": stat})
                             observations.append((t_uid, code, val))
                     else:
+                        # wide format: first row has values
                         for c in df.columns:
-                            try: val = float(df[c].iloc[0])
-                            except: continue
+                            try:
+                                val = float(df[c].iloc[0])
+                            except Exception:
+                                continue
                             code = str(c)
                             feature_rows.append({"code": code, "value": val, "stat": "value"})
                             observations.append((t_uid, code, val))
 
-            # write batches
+            # write in batches
             if files_rows:
                 with driver.session() as sess:
-                    sess.execute_write(attach_files_batch_tx, pid, trial_id, files_rows)
+                    sess.execute_write(attach_files_batch_tx, pid, group, trial_id, files_rows)
             if feature_rows:
                 with driver.session() as sess:
-                    sess.execute_write(attach_features_tx, pid, trial_id, feature_rows)
+                    sess.execute_write(attach_features_tx, pid, group, trial_id, feature_rows)
 
     return observations
 
-# --------------- Correlations ---------------
+# ---------------- Correlations ----------------
 def build_feature_correlations(observations: List[Tuple[str, str, float]]):
     if not observations:
         log("[INFO] No observations; skip correlations.")
         return
+
     df = pd.DataFrame(observations, columns=["trial_uid", "feature_code", "value"])
+    # wide matrix: trial x feature
     mat = df.pivot_table(index="trial_uid", columns="feature_code", values="value", aggfunc="mean")
+
+    # pairwise correlation with min observations
     corr = mat.corr(method=CORR_METHOD, min_periods=CORR_MIN_PAIRS)
 
+    # co-presence counts
     present = mat.notna().astype(np.uint8)
     co = present.T @ present
+
     feats = list(mat.columns)
     created = 0
     log(f"[INFO] Correlation method={CORR_METHOD} min_abs={CORR_MIN_ABS_R} min_pairs={CORR_MIN_PAIRS}")
 
     with driver.session() as sess:
         for i in range(len(feats)):
-            for j in range(i+1, len(feats)):
+            for j in range(i + 1, len(feats)):
                 fi, fj = feats[i], feats[j]
                 n = int(co.loc[fi, fj]) if fi in co.index and fj in co.columns else 0
-                if n < CORR_MIN_PAIRS: continue
+                if n < CORR_MIN_PAIRS:
+                    continue
                 r = corr.loc[fi, fj]
-                if pd.isna(r) or abs(r) < CORR_MIN_ABS_R: continue
-                sess.execute_write(upsert_feature_correlation_tx,
-                                   fi, fj, float(r), n, CORR_METHOD,
-                                   CORR_MIN_ABS_R, CORR_MIN_PAIRS)
+                if pd.isna(r) or abs(r) < CORR_MIN_ABS_R:
+                    continue
+                sess.execute_write(
+                    upsert_feature_correlation_tx,
+                    fi, fj, float(r), n, CORR_METHOD, CORR_MIN_ABS_R, CORR_MIN_PAIRS
+                )
                 created += 1
+
     log(f"[INFO] Correlation edges created/updated: {created}")
 
-# --------------- Main ---------------
+# ---------------- Main ----------------
 if __name__ == "__main__":
     print(f"Scanning dataset root: {ROOT}", flush=True)
+
     if ONLY_CORR:
-        # (προαιρετικό) αν έχεις ήδη φορτώσει παρατηρήσεις και θες μόνο correlations,
-        # θα έπρεπε να τις ξαναδιαβάσουμε από DB. Εδώ κρατάμε το απλό path: κάνε full run.
         print("[WARN] ONLY_CORR=1 not implemented to pull from DB; run full ingest.", flush=True)
         sys.exit(0)
 
