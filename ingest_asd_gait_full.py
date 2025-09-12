@@ -39,6 +39,9 @@ import numpy as np
 from neo4j import GraphDatabase
 from dotenv import load_dotenv
 
+HERE = Path(__file__).resolve().parent
+load_dotenv(dotenv_path=HERE / ".env", override=True)
+
 # --------------------------
 # Load configuration
 # --------------------------
