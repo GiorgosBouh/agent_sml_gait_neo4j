@@ -2,281 +2,153 @@
 # -*- coding: utf-8 -*-
 
 """
-Rule-based NL → Cypher for ASD Gait graph.
+NL → Cypher for ASD Gait graph with hybrid logic:
+- Rule-based exact matches first (fast, deterministic).
+- If no exact match, fallback to FREE local small language model (Ollama).
+- If LLM not reachable, fallback to noop query.
 
-Graph schema (provided):
+Schema:
   (:Subject {pid,sid})-[:HAS_TRIAL]->(:Trial {uid})
   (:Trial)-[:HAS_FILE]->(:File {uid,kind})
   (:Trial)-[:HAS_FEATURE]->(:FeatureValue {value})-[:OF_FEATURE]->(:Feature {code,stat})
-
-Exposes:
-  class NL2Cypher:
-      def to_cypher(self, question: str) -> str
 """
 
-import re
-from typing import Dict, Tuple, Optional
+import os, re, json, requests
+from typing import Dict, Any, Optional
 
-# ----------------------- Dictionaries -----------------------
-# keyword → (feature-code stem, human name)
-JOINT_STEMS: Dict[str, Tuple[str, str]] = {
-    # Knee
-    "knee": ("HIAN", "Knee"),
-    "γόνα": ("HIAN", "Knee"),
-    "gonato": ("HIAN", "Knee"),
-    # Ankle
-    "ankle": ("KNFO", "Ankle"),
-    "ποδοκν": ("KNFO", "Ankle"),
-    # Hip
-    "hip": ("SPKN", "Hip"),
-    "ισχ": ("SPKN", "Hip"),
-    # Trunk
-    "trunk": ("THHTI", "TrunkTilt"),
-    "κορμ": ("THHTI", "TrunkTilt"),
-    # Spine / Pelvis (if present in codes)
-    "spine": ("SPINE", "Spine"),
-    "pelvis": ("SPEL", "Pelvis"),
-}
+# ------------------- Config -------------------
+USE_LLM = str(os.getenv("USE_LLM", "false")).lower() in ("1","true","yes")
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:3b-instruct")
+OLLAMA_TIMEOUT = float(os.getenv("OLLAMA_TIMEOUT", "12.0"))
 
-# label → (Feature.code, unit)
-SPATIOTEMPORAL: Dict[str, Tuple[str, str]] = {
-    "velocity": ("Velocity", "m/s"),
-    "stance": ("StaT", "ms"),
-    "swing": ("SwiT", "ms"),
-    "gait cycle": ("GaCT", "ms"),
-    "stride length": ("StrLe", "m"),
-    "step length": ("MaxStLe", "m"),
-    "step width": ("MaxStWi", "m"),
-}
-
-# ----------------------- Helpers -----------------------
-def detect_condition(q: str) -> str:
-    uq = q.lower()
-    # ASD vs TD together
-    if re.search(r"\basd\b.*(vs|and|&|,)\s*\btd\b", uq) or re.search(r"\btd\b.*(vs|and|&|,)\s*\basd\b", uq):
-        return "BOTH"
-    # ASD
-    if "asd" in uq or "αυτισ" in uq:
-        return "ASD"
-    # TD / typical / control
-    if re.search(r"\btd\b", uq) or "τυπικ" in uq or "control" in uq:
-        return "TD"
-    return "BOTH"
-
-def detect_side(q: str) -> str:
-    uq = q.lower()
-    if re.search(r"\b(left|αριστερ(?:ά|η)|αρ\.)\b", uq): return "L"
-    if re.search(r"\b(right|δεξι(?:ά|ή)|δε\.)\b", uq): return "R"
-    return "BOTH"
-
-def detect_joint(q: str) -> Optional[Tuple[str, str]]:
-    uq = q.lower()
-    for key, (stem, name) in JOINT_STEMS.items():
-        if key in uq:
-            return stem, name
-    return None
-
-def spatiotemporal_key(q: str) -> Optional[str]:
-    uq = q.lower()
-    for label in SPATIOTEMPORAL.keys():
-        if label in uq or label.replace(" ", "") in uq:
-            return label
-    return None
-
-def feature_regex_from_text(q: str) -> Optional[str]:
-    # e.g., "list features like HIAN", "codes regex HIAN.*R"
-    m = re.search(r"(features?|codes?|χαρακτηριστικ\w*|κωδικ\w*)\s*(?:like|όπως|=|regex)\s*([A-Za-z0-9\-\_\.\\\*]+)", q, flags=re.IGNORECASE)
-    if m:
-        return m.group(2).replace("*", ".*")
-    return None
-
-def asks_coupling(q: str) -> Optional[Tuple[str, str]]:
-    uq = q.lower()
-    if "coupling" in uq or "συσχέτι" in uq or "correlat" in uq or "regress" in uq:
-        keys = [k for k in JOINT_STEMS.keys() if k in uq]
-        if len(keys) >= 2:
-            a = JOINT_STEMS[keys[0]][0]
-            b = JOINT_STEMS[keys[1]][0]
-            return a, b
-        return "HIAN", "KNFO"  # default Knee → Ankle
-    return None
-
-# ----------------------- Cypher templates (single-WHERE safe) -----------------------
-def _side_filter_and_expr(joint_stem: str, side: str) -> Tuple[str, str]:
-    """
-    Returns (filter_on_f_code, side_expr)
-    filter_on_f_code is a boolean expression fragment (no leading WHERE).
-    """
-    if side == "BOTH":
-        side_filter = f"(f.code =~ '(?i).*{joint_stem}L\\s*$' OR f.code =~ '(?i).*{joint_stem}R\\s*$')"
-        side_expr   = "CASE WHEN f.code =~ '(?i).*L\\s*$' THEN 'L' ELSE 'R' END"
-    else:
-        side_filter = f"f.code =~ '(?i).*{joint_stem}{side}\\s*$'"
-        side_expr   = f"'{side}'"
-    return side_filter, side_expr
-
-def cy_count_subjects() -> str:
-    return """
-MATCH (s:Subject)
-RETURN
-  sum(CASE WHEN s.pid STARTS WITH 'ASD:' THEN 1 ELSE 0 END) AS asd_cases,
-  sum(CASE WHEN s.pid STARTS WITH 'TD:'  THEN 1 ELSE 0 END) AS td_cases;
-""".strip()
-
-def cy_list_features(regex_like: str) -> str:
-    return f"""
-MATCH (f:Feature)
-WHERE f.code =~ '(?i).*{regex_like}.*'
-RETURN f.code AS code, f.stat AS stat
-ORDER BY code
-LIMIT 200;
-""".strip()
-
-def cy_spatiotemporal_mean(cond: str, feature_code: str) -> str:
-    # Build a single WHERE
-    where_parts = [f"f.code='{feature_code}'"]
-    if cond != "BOTH":
-        where_parts.insert(0, f"s.pid STARTS WITH '{cond}:'")
-    where_clause = "WHERE " + " AND ".join(where_parts)
-
-    cond_case = "CASE WHEN s.pid STARTS WITH 'ASD:' THEN 'ASD' WHEN s.pid STARTS WITH 'TD:' THEN 'TD' ELSE 'UNK' END"
-
-    return f"""
+# ------------------- Templates -------------------
+TEMPLATES = {
+    "count": "MATCH (s:Subject) RETURN sum(CASE WHEN s.pid STARTS WITH 'ASD:' THEN 1 ELSE 0 END) AS asd_cases, sum(CASE WHEN s.pid STARTS WITH 'TD:' THEN 1 ELSE 0 END) AS td_cases;",
+    "correlations": """
+MATCH (a:Feature)-[r:CORRELATED_WITH]->(b:Feature)
+RETURN a.code AS A, b.code AS B, r.r AS r, r.n AS n
+ORDER BY abs(r) DESC, n DESC
+LIMIT 20;""",
+    "completeness": """
+MATCH (t:Trial)
+OPTIONAL MATCH (t)-[:HAS_FILE]->(f:File)
+WITH t, collect(DISTINCT f.kind) AS kinds
+OPTIONAL MATCH (t)-[:HAS_FEATURE]->(fv:FeatureValue)-[:OF_FEATURE]->(feat:Feature)
+WITH t, kinds, count(DISTINCT fv) AS nvals, count(DISTINCT feat) AS nfeats
+RETURN count(*) AS trials,
+       sum(CASE WHEN size(kinds)=4 THEN 1 ELSE 0 END) AS trials_all_files,
+       sum(CASE WHEN nvals=463 AND nfeats=463 THEN 1 ELSE 0 END) AS trials_complete;""",
+    "mean": """
 MATCH (s:Subject)-[:HAS_TRIAL]->(:Trial)-[:HAS_FEATURE]->(fv:FeatureValue)-[:OF_FEATURE]->(f:Feature)
-{where_clause}
-WITH {cond_case} AS condition, s.pid AS pid, avg(fv.value) AS subj_mean
-RETURN condition, round(avg(subj_mean),3) AS mean_value, count(*) AS n
-ORDER BY condition;
-""".strip()
-
-def cy_mean_per_subject(cond: str, side: str, joint_stem: str, stat: str = "mean") -> str:
-    side_filter, side_expr = _side_filter_and_expr(joint_stem, side)
-
-    # Build a single WHERE
-    where_parts = [f"f.stat='{stat}'", side_filter]
-    if cond != "BOTH":
-        where_parts.insert(0, f"s.pid STARTS WITH '{cond}:'")
-    where_clause = "WHERE " + " AND ".join(where_parts)
-
-    cond_case = "CASE WHEN s.pid STARTS WITH 'ASD:' THEN 'ASD' WHEN s.pid STARTS WITH 'TD:' THEN 'TD' ELSE 'UNK' END"
-
-    return f"""
-MATCH (s:Subject)-[:HAS_TRIAL]->(:Trial)-[:HAS_FEATURE]->(fv:FeatureValue)-[:OF_FEATURE]->(f:Feature)
-{where_clause}
-WITH {cond_case} AS condition, {side_expr} AS side, s.pid AS pid, avg(fv.value) AS subj_mean
+WHERE {where_clause}
+WITH CASE WHEN s.pid STARTS WITH 'ASD:' THEN 'ASD' WHEN s.pid STARTS WITH 'TD:' THEN 'TD' ELSE 'UNK' END AS condition,
+     {side_expr} AS side, s.pid AS pid, avg(fv.value) AS subj_mean
 RETURN condition, side, round(avg(subj_mean),2) AS mean_value, count(*) AS n
-ORDER BY condition, side;
-""".strip()
+ORDER BY condition, side;"""
+}
 
-def cy_compare_groups(code_pattern: str, stat: str = "mean") -> str:
-    # Uses param grp in UNWIND; one WHERE is fine here.
-    return f"""
-UNWIND ['ASD','TD'] AS grp
-MATCH (s:Subject)-[:HAS_TRIAL]->(:Trial)-[:HAS_FEATURE]->(fv:FeatureValue)-[:OF_FEATURE]->(f:Feature)
-WHERE s.pid STARTS WITH grp + ':' AND f.stat='{stat}' AND f.code =~ '(?i).*{code_pattern}\\s*$'
-WITH grp AS condition, s.pid AS pid, avg(fv.value) AS subj_mean
-RETURN condition, round(avg(subj_mean),3) AS mean_value, count(*) AS n
-ORDER BY condition;
-""".strip()
+# ------------------- Helpers (rules) -------------------
+def _detect_condition(q: str) -> str:
+    ql = q.lower()
+    if "asd" in ql: return "ASD"
+    if "td" in ql or "τυπ" in ql or "control" in ql: return "TD"
+    return "BOTH"
 
-def cy_coupling_ols(cond: str, side: str, a_stem: str, b_stem: str) -> str:
-    """
-    Simple OLS between two feature stems (A on B) per group/side.
-    We must avoid double WHERE after the first MATCH.
-    """
-    cond_pred = None if cond == "BOTH" else f"s.pid STARTS WITH '{cond}:'"
+def _detect_side(q: str) -> str:
+    ql = q.lower()
+    if "right" in ql or "δεξ" in ql: return "R"
+    if "left" in ql or "αριστ" in ql: return "L"
+    return "BOTH"
 
-    # First MATCH (A): build single WHERE
-    a_filters = []
-    if cond_pred: a_filters.append(cond_pred)
-    a_filters.append("af.stat='mean'")
-    a_filters.append("af.code =~ ('(?i).*' + a_stem + side + '\\s*$')")
-    a_where = "WHERE " + " AND ".join(a_filters)
+def _detect_joint(q: str) -> Optional[str]:
+    ql = q.lower()
+    if "knee" in ql or "γόνα" in ql: return "HIAN"
+    if "hip" in ql or "ισχ" in ql: return "SPKN"
+    if "ankle" in ql or "ποδο" in ql: return "KNFO"
+    if "trunk" in ql or "κορμ" in ql: return "THHTI"
+    if "pelvis" in ql or "λεκ" in ql or "πυελ" in ql: return "SPEL"
+    return None
 
-    # Second MATCH (B): separate MATCH -> one WHERE is fine
-    b_where = "WHERE bf.stat='mean' AND bf.code =~ ('(?i).*' + b_stem + side + '\\s*$')"
+def _detect_intent(q: str) -> str:
+    ql = q.lower()
+    if "count" in ql or "πόσα" in ql: return "count"
+    if "correl" in ql or "συσχ" in ql: return "correlations"
+    if "complete" in ql or "πλήρη" in ql: return "completeness"
+    if "compare" in ql or "σύγκρι" in ql or "vs" in ql: return "compare"
+    if "mean" in ql or "average" in ql or "μέση" in ql or "μ.ο." in ql: return "mean"
+    return "unknown"
 
-    cond_case = "CASE WHEN s.pid STARTS WITH 'ASD:' THEN 'ASD' WHEN s.pid STARTS WITH 'TD:' THEN 'TD' ELSE 'UNK' END"
+# ------------------- Ollama -------------------
+SYS_PROMPT = """You are an assistant that extracts slots from a clinical gait query.
+Return ONLY strict JSON:
+{"intent":"mean|compare|count|correlations|completeness",
+ "joint":"knee|hip|ankle|trunk|pelvis",
+ "side":"L|R|BOTH",
+ "cond":"ASD|TD|BOTH",
+ "stat":"mean|std|var"}"""
 
-    return f"""
-WITH '{a_stem}' AS a_stem, '{b_stem}' AS b_stem
-WITH a_stem, b_stem, CASE WHEN '{side}'='BOTH' THEN ['L','R'] ELSE ['{side}'] END AS sides
-UNWIND sides AS side
-MATCH (s:Subject)-[:HAS_TRIAL]->(:Trial)-[:HAS_FEATURE]->(av:FeatureValue)-[:OF_FEATURE]->(af:Feature)
-{a_where}
-MATCH (s)-[:HAS_TRIAL]->(:Trial)-[:HAS_FEATURE]->(bv:FeatureValue)-[:OF_FEATURE]->(bf:Feature)
-{b_where}
-WITH {cond_case} AS condition, side, s.pid AS pid, avg(av.value) AS A, avg(bv.value) AS B
-WITH condition, side, collect({{a:A, b:B}}) AS pairs
-UNWIND pairs AS p
-WITH condition, side,
-     count(*) AS n,
-     sum(p.a) AS sa, sum(p.b) AS sb,
-     sum(p.a*p.b) AS sab,
-     sum(p.a*p.a) AS saa, sum(p.b*p.b) AS sbb
-WITH condition, side, n, sa, sb, sab, saa, sbb,
-     (n*saa - sa*sa) AS denom,
-     (n*sab - sa*sb) AS num,
-     (n*sbb - sb*sb) AS Syy
-RETURN condition, side, n,
-       round(CASE WHEN denom<>0 THEN num/denom ELSE null END,4) AS beta,
-       round(CASE WHEN denom>0 AND Syy>0 THEN (num*num)/(denom*Syy) ELSE null END,4) AS R2
-ORDER BY condition, side;
-""".strip()
+def _ollama_generate(prompt: str) -> Optional[str]:
+    try:
+        r = requests.post(f"{OLLAMA_URL}/api/generate",
+                          json={"model": OLLAMA_MODEL, "prompt": prompt, "stream": False},
+                          timeout=OLLAMA_TIMEOUT)
+        if r.status_code == 200:
+            return r.json().get("response","").strip()
+    except Exception:
+        return None
+    return None
 
-# ----------------------- NL engine -----------------------
+def _llm_parse(q: str) -> Optional[Dict[str,str]]:
+    if not USE_LLM: return None
+    resp = _ollama_generate(SYS_PROMPT + "\nQuery: " + q)
+    if not resp: return None
+    try:
+        js = re.search(r"\{.*\}", resp, re.DOTALL).group(0)
+        return json.loads(js)
+    except Exception:
+        return None
+
+# ------------------- Engine -------------------
 class NL2Cypher:
-    """
-    Minimal, deterministic NL → Cypher engine.
-    Usage:
-        engine = NL2Cypher()
-        cypher = engine.to_cypher("compare ASD vs TD knee right mean")
-    """
-    def __init__(self) -> None:
-        pass
+    def __init__(self): pass
 
-    def to_cypher(self, question: str) -> str:
-        q = (question or "").strip()
+    def to_cypher(self, q: str) -> str:
+        q = (q or "").strip()
         if not q:
             return "MATCH (n) RETURN count(n) AS nodes LIMIT 1;"
 
-        # counts
-        if re.search(r"\b(count|how many|πόσα)\b.*\b(asd|td|subjects|participants|cases)\b", q, flags=re.IGNORECASE):
-            return cy_count_subjects()
+        # 1. Rule-based
+        intent = _detect_intent(q)
+        cond   = _detect_condition(q)
+        side   = _detect_side(q)
+        joint  = _detect_joint(q)
 
-        # list features like/regex
-        rgx = feature_regex_from_text(q)
-        if rgx:
-            return cy_list_features(rgx)
+        if intent in ("count","correlations","completeness"):
+            return TEMPLATES[intent]
 
-        # spatiotemporal
-        sp = spatiotemporal_key(q)
-        if sp:
-            cond = detect_condition(q)
-            code, _unit = SPATIOTEMPORAL[sp]
-            return cy_spatiotemporal_mean(cond, code)
+        if intent == "mean" and joint:
+            side_expr = f"'{side}'" if side in ("L","R") else "CASE WHEN f.code =~ '(?i).*L$' THEN 'L' ELSE 'R' END"
+            regex = f"(?i).*{joint}{side}\\s*$" if side in ("L","R") else f"(?i).*{joint}[LR]\\s*$"
+            where_clause = f"s.pid STARTS WITH '{cond}:' AND f.stat='mean' AND f.code =~ '{regex}'" if cond!="BOTH" else f"f.stat='mean' AND f.code =~ '{regex}'"
+            return TEMPLATES["mean"].format(where_clause=where_clause, side_expr=side_expr)
 
-        # coupling/regression between joints
-        cp = asks_coupling(q)
-        if cp:
-            cond = detect_condition(q)
-            side = detect_side(q)
-            a_stem, b_stem = cp
-            return cy_coupling_ols(cond, side, a_stem, b_stem)
+        # 2. If no exact match → LLM
+        slots = _llm_parse(q)
+        if slots:
+            intent = slots.get("intent","mean").lower()
+            cond   = slots.get("cond","BOTH").upper()
+            side   = slots.get("side","BOTH").upper()
+            joint  = slots.get("joint","knee").lower()
+            stat   = slots.get("stat","mean").lower()
+            if intent=="count": return TEMPLATES["count"]
+            if intent=="correlations": return TEMPLATES["correlations"]
+            if intent=="completeness": return TEMPLATES["completeness"]
+            if intent=="mean":
+                side_expr = f"'{side}'" if side in ("L","R") else "CASE WHEN f.code =~ '(?i).*L$' THEN 'L' ELSE 'R' END"
+                regex = f"(?i).*{joint.upper()}{side}\\s*$" if side in ("L","R") else f"(?i).*{joint.upper()}[LR]\\s*$"
+                where_clause = f"s.pid STARTS WITH '{cond}:' AND f.stat='{stat}' AND f.code =~ '{regex}'" if cond!="BOTH" else f"f.stat='{stat}' AND f.code =~ '{regex}'"
+                return TEMPLATES["mean"].format(where_clause=where_clause, side_expr=side_expr)
 
-        # compare ASD vs TD for a joint (optionally side)
-        if re.search(r"(compare|vs|diff|σύγκρι|διαφορ)", q, flags=re.IGNORECASE):
-            side = detect_side(q)
-            js = detect_joint(q) or ("HIAN", "Knee")
-            code_pat = f"{js[0]}{'' if side=='BOTH' else side}"
-            return cy_compare_groups(code_pat)
-
-        # mean for joint by side/cond
-        if re.search(r"(mean|avg|average|μ\.?ο\.?|μέση)", q, flags=re.IGNORECASE) or detect_joint(q):
-            cond = detect_condition(q)
-            side = detect_side(q)
-            js = detect_joint(q) or ("HIAN", "Knee")
-            return cy_mean_per_subject(cond, side, js[0], "mean")
-
-        # fallback
+        # 3. Fallback
         return "MATCH (n) RETURN count(n) AS nodes LIMIT 1;"
