@@ -1,8 +1,39 @@
 [
-  {"intent":"count_subjects_by_condition", "patterns": ["\\bhow\\s+many\\b.*\\basd\\b", "\\bπόσοι\\b.*\\basd\\b"]},
-  {"intent":"count_subjects", "patterns": ["\\bhow\\s+many\\b.*(subjects|participants|cases)\\b", "πόσοι .* (συμμετέχ|υποκείμεν)"]},
-  {"intent":"mean_joint_side_condition", "patterns": [
-    "(mean|μέση).*\\b(knee|γόνατο|ankle|ποδοκνημική|hip|ισχίο)\\b.*(left|right|αρισ|δεξ).*\\b(asd|td|typical)\\b"
-  ]},
-  {"intent":"coupling_knee_ankle", "patterns": ["\\b(coupling|συσχ|συσχέτιση)\\b.*(knee|γόνατο).*\\b(ankle|ποδοκνημική)\\b"]}
+  {
+    "intent": "mean_of_feature_by_cond_side_joint",
+    "patterns": [
+      "(?i)mean|average|μ.ο\\.|μέση",
+      "(?i)knee|γόνατο|hip|ισχίο|ankle|ποδοκνημική|trunk|κορμός|spine|σπονδυλικ",
+      "(?i)asd|td|τυπικ|control"
+    ]
+  },
+  {
+    "intent": "compare_asd_td_feature",
+    "patterns": [
+      "(?i)compare|σύγκρι",
+      "(?i)asd|td",
+      "(?i)knee|hip|ankle|trunk|spine|γόνατο|ισχίο|ποδοκνημική|κορμός|σπονδυλικ"
+    ]
+  },
+  {
+    "intent": "top_correlated_pairs",
+    "patterns": [
+      "(?i)top|most|υψηλ",
+      "(?i)correl|συσχετ"
+    ]
+  },
+  {
+    "intent": "list_trials_files_complete",
+    "patterns": [
+      "(?i)trials.*files|αρχεία|kinds|πλήρη",
+      "(?i)complete|όλα"
+    ]
+  },
+  {
+    "intent": "count_nodes_labels",
+    "patterns": [
+      "(?i)count|πόσα",
+      "(?i)subjects|trials|files|features|featurevalues|κόμβοι|σχέσεις"
+    ]
+  }
 ]
