@@ -4,12 +4,12 @@
 """
 Rule-based NL → Cypher for ASD Gait graph.
 
-Graph schema (as provided):
+Graph schema (provided):
   (:Subject {pid,sid})-[:HAS_TRIAL]->(:Trial {uid})
   (:Trial)-[:HAS_FILE]->(:File {uid,kind})
   (:Trial)-[:HAS_FEATURE]->(:FeatureValue {value})-[:OF_FEATURE]->(:Feature {code,stat})
 
-This module exposes:
+Exposes:
   class NL2Cypher:
       def to_cypher(self, question: str) -> str
 """
@@ -18,23 +18,28 @@ import re
 from typing import Dict, Tuple, Optional
 
 # ----------------------- Dictionaries -----------------------
+# keyword → (feature-code stem, human name)
 JOINT_STEMS: Dict[str, Tuple[str, str]] = {
-    # keyword → (feature code stem, nice name)
+    # Knee
     "knee": ("HIAN", "Knee"),
     "γόνα": ("HIAN", "Knee"),
     "gonato": ("HIAN", "Knee"),
+    # Ankle
     "ankle": ("KNFO", "Ankle"),
     "ποδοκν": ("KNFO", "Ankle"),
+    # Hip
     "hip": ("SPKN", "Hip"),
     "ισχ": ("SPKN", "Hip"),
+    # Trunk
     "trunk": ("THHTI", "TrunkTilt"),
     "κορμ": ("THHTI", "TrunkTilt"),
+    # Spine / Pelvis (if present in codes)
     "spine": ("SPINE", "Spine"),
     "pelvis": ("SPEL", "Pelvis"),
 }
 
+# label → (Feature.code, unit)
 SPATIOTEMPORAL: Dict[str, Tuple[str, str]] = {
-    # label → (Feature.code, unit)
     "velocity": ("Velocity", "m/s"),
     "stance": ("StaT", "ms"),
     "swing": ("SwiT", "ms"),
@@ -47,10 +52,13 @@ SPATIOTEMPORAL: Dict[str, Tuple[str, str]] = {
 # ----------------------- Helpers -----------------------
 def detect_condition(q: str) -> str:
     uq = q.lower()
+    # ASD vs TD together
     if re.search(r"\basd\b.*(vs|and|&|,)\s*\btd\b", uq) or re.search(r"\btd\b.*(vs|and|&|,)\s*\basd\b", uq):
         return "BOTH"
+    # ASD
     if "asd" in uq or "αυτισ" in uq:
         return "ASD"
+    # TD / typical / control
     if re.search(r"\btd\b", uq) or "τυπικ" in uq or "control" in uq:
         return "TD"
     return "BOTH"
@@ -76,6 +84,7 @@ def spatiotemporal_key(q: str) -> Optional[str]:
     return None
 
 def feature_regex_from_text(q: str) -> Optional[str]:
+    # e.g., "list features like HIAN", "codes regex HIAN.*R"
     m = re.search(r"(features?|codes?|χαρακτηριστικ\w*|κωδικ\w*)\s*(?:like|όπως|=|regex)\s*([A-Za-z0-9\-\_\.\\\*]+)", q, flags=re.IGNORECASE)
     if m:
         return m.group(2).replace("*", ".*")
@@ -84,50 +93,83 @@ def feature_regex_from_text(q: str) -> Optional[str]:
 def asks_coupling(q: str) -> Optional[Tuple[str, str]]:
     uq = q.lower()
     if "coupling" in uq or "συσχέτι" in uq or "correlat" in uq or "regress" in uq:
-        # best-effort: find two joints
         keys = [k for k in JOINT_STEMS.keys() if k in uq]
         if len(keys) >= 2:
             a = JOINT_STEMS[keys[0]][0]
             b = JOINT_STEMS[keys[1]][0]
             return a, b
-        # default Knee→Ankle
-        return "HIAN", "KNFO"
+        return "HIAN", "KNFO"  # default Knee → Ankle
     return None
 
-# ----------------------- Cypher templates -----------------------
-def cy_unwind_sides(side: str) -> str:
-    return "WITH CASE WHEN '{s}'='BOTH' THEN ['L','R'] ELSE ['{s}'] END AS sides\nUNWIND sides AS side".format(s=side)
-
-def cy_mean_per_subject(cond: str, side: str, joint_stem: str, stat: str = "mean") -> str:
+# ----------------------- Cypher templates (single-WHERE safe) -----------------------
+def _side_filter_and_expr(joint_stem: str, side: str) -> Tuple[str, str]:
+    """
+    Returns (filter_on_f_code, side_expr)
+    filter_on_f_code is a boolean expression fragment (no leading WHERE).
+    """
     if side == "BOTH":
         side_filter = f"(f.code =~ '(?i).*{joint_stem}L\\s*$' OR f.code =~ '(?i).*{joint_stem}R\\s*$')"
-        side_expr = "CASE WHEN f.code =~ '(?i).*L\\s*$' THEN 'L' ELSE 'R' END"
+        side_expr   = "CASE WHEN f.code =~ '(?i).*L\\s*$' THEN 'L' ELSE 'R' END"
     else:
         side_filter = f"f.code =~ '(?i).*{joint_stem}{side}\\s*$'"
-        side_expr = f"'{side}'"
-    cond_case = "CASE WHEN s.pid STARTS WITH 'ASD:' THEN 'ASD' WHEN s.pid STARTS WITH 'TD:' THEN 'TD' ELSE 'UNK' END"
-    cond_filter = "" if cond == "BOTH" else f"WHERE s.pid STARTS WITH '{cond}:'"
+        side_expr   = f"'{side}'"
+    return side_filter, side_expr
+
+def cy_count_subjects() -> str:
+    return """
+MATCH (s:Subject)
+RETURN
+  sum(CASE WHEN s.pid STARTS WITH 'ASD:' THEN 1 ELSE 0 END) AS asd_cases,
+  sum(CASE WHEN s.pid STARTS WITH 'TD:'  THEN 1 ELSE 0 END) AS td_cases;
+""".strip()
+
+def cy_list_features(regex_like: str) -> str:
     return f"""
-MATCH (s:Subject)-[:HAS_TRIAL]->(:Trial)-[:HAS_FEATURE]->(fv:FeatureValue)-[:OF_FEATURE]->(f:Feature)
-{cond_filter}
-WHERE f.stat='{stat}' AND {side_filter}
-WITH {cond_case} AS condition, {side_expr} AS side, s.pid AS pid, avg(fv.value) AS subj_mean
-RETURN condition, side, round(avg(subj_mean),2) AS mean_value, count(*) AS n
-ORDER BY condition, side;
+MATCH (f:Feature)
+WHERE f.code =~ '(?i).*{regex_like}.*'
+RETURN f.code AS code, f.stat AS stat
+ORDER BY code
+LIMIT 200;
 """.strip()
 
 def cy_spatiotemporal_mean(cond: str, feature_code: str) -> str:
+    # Build a single WHERE
+    where_parts = [f"f.code='{feature_code}'"]
+    if cond != "BOTH":
+        where_parts.insert(0, f"s.pid STARTS WITH '{cond}:'")
+    where_clause = "WHERE " + " AND ".join(where_parts)
+
     cond_case = "CASE WHEN s.pid STARTS WITH 'ASD:' THEN 'ASD' WHEN s.pid STARTS WITH 'TD:' THEN 'TD' ELSE 'UNK' END"
-    cond_filter = "" if cond == "BOTH" else f"WHERE s.pid STARTS WITH '{cond}:'"
+
     return f"""
-MATCH (s:Subject)-[:HAS_TRIAL]->(:Trial)-[:HAS_FEATURE]->(fv:FeatureValue)-[:OF_FEATURE]->(f:Feature {{code:'{feature_code}'}})
-{cond_filter}
+MATCH (s:Subject)-[:HAS_TRIAL]->(:Trial)-[:HAS_FEATURE]->(fv:FeatureValue)-[:OF_FEATURE]->(f:Feature)
+{where_clause}
 WITH {cond_case} AS condition, s.pid AS pid, avg(fv.value) AS subj_mean
 RETURN condition, round(avg(subj_mean),3) AS mean_value, count(*) AS n
 ORDER BY condition;
 """.strip()
 
+def cy_mean_per_subject(cond: str, side: str, joint_stem: str, stat: str = "mean") -> str:
+    side_filter, side_expr = _side_filter_and_expr(joint_stem, side)
+
+    # Build a single WHERE
+    where_parts = [f"f.stat='{stat}'", side_filter]
+    if cond != "BOTH":
+        where_parts.insert(0, f"s.pid STARTS WITH '{cond}:'")
+    where_clause = "WHERE " + " AND ".join(where_parts)
+
+    cond_case = "CASE WHEN s.pid STARTS WITH 'ASD:' THEN 'ASD' WHEN s.pid STARTS WITH 'TD:' THEN 'TD' ELSE 'UNK' END"
+
+    return f"""
+MATCH (s:Subject)-[:HAS_TRIAL]->(:Trial)-[:HAS_FEATURE]->(fv:FeatureValue)-[:OF_FEATURE]->(f:Feature)
+{where_clause}
+WITH {cond_case} AS condition, {side_expr} AS side, s.pid AS pid, avg(fv.value) AS subj_mean
+RETURN condition, side, round(avg(subj_mean),2) AS mean_value, count(*) AS n
+ORDER BY condition, side;
+""".strip()
+
 def cy_compare_groups(code_pattern: str, stat: str = "mean") -> str:
+    # Uses param grp in UNWIND; one WHERE is fine here.
     return f"""
 UNWIND ['ASD','TD'] AS grp
 MATCH (s:Subject)-[:HAS_TRIAL]->(:Trial)-[:HAS_FEATURE]->(fv:FeatureValue)-[:OF_FEATURE]->(f:Feature)
@@ -138,16 +180,32 @@ ORDER BY condition;
 """.strip()
 
 def cy_coupling_ols(cond: str, side: str, a_stem: str, b_stem: str) -> str:
+    """
+    Simple OLS between two feature stems (A on B) per group/side.
+    We must avoid double WHERE after the first MATCH.
+    """
+    cond_pred = None if cond == "BOTH" else f"s.pid STARTS WITH '{cond}:'"
+
+    # First MATCH (A): build single WHERE
+    a_filters = []
+    if cond_pred: a_filters.append(cond_pred)
+    a_filters.append("af.stat='mean'")
+    a_filters.append("af.code =~ ('(?i).*' + a_stem + side + '\\s*$')")
+    a_where = "WHERE " + " AND ".join(a_filters)
+
+    # Second MATCH (B): separate MATCH -> one WHERE is fine
+    b_where = "WHERE bf.stat='mean' AND bf.code =~ ('(?i).*' + b_stem + side + '\\s*$')"
+
     cond_case = "CASE WHEN s.pid STARTS WITH 'ASD:' THEN 'ASD' WHEN s.pid STARTS WITH 'TD:' THEN 'TD' ELSE 'UNK' END"
-    cond_filter = "" if cond == "BOTH" else f"WHERE s.pid STARTS WITH '{cond}:'"
+
     return f"""
-{cy_unwind_sides(side)}
-WITH side, '{a_stem}' AS a_stem, '{b_stem}' AS b_stem
+WITH '{a_stem}' AS a_stem, '{b_stem}' AS b_stem
+WITH a_stem, b_stem, CASE WHEN '{side}'='BOTH' THEN ['L','R'] ELSE ['{side}'] END AS sides
+UNWIND sides AS side
 MATCH (s:Subject)-[:HAS_TRIAL]->(:Trial)-[:HAS_FEATURE]->(av:FeatureValue)-[:OF_FEATURE]->(af:Feature)
-{cond_filter}
-WHERE af.stat='mean' AND af.code =~ ('(?i).*' + a_stem + side + '\\s*$')
+{a_where}
 MATCH (s)-[:HAS_TRIAL]->(:Trial)-[:HAS_FEATURE]->(bv:FeatureValue)-[:OF_FEATURE]->(bf:Feature)
-WHERE bf.stat='mean' AND bf.code =~ ('(?i).*' + b_stem + side + '\\s*$')
+{b_where}
 WITH {cond_case} AS condition, side, s.pid AS pid, avg(av.value) AS A, avg(bv.value) AS B
 WITH condition, side, collect({{a:A, b:B}}) AS pairs
 UNWIND pairs AS p
@@ -164,23 +222,6 @@ RETURN condition, side, n,
        round(CASE WHEN denom<>0 THEN num/denom ELSE null END,4) AS beta,
        round(CASE WHEN denom>0 AND Syy>0 THEN (num*num)/(denom*Syy) ELSE null END,4) AS R2
 ORDER BY condition, side;
-""".strip()
-
-def cy_list_features(regex_like: str) -> str:
-    return f"""
-MATCH (f:Feature)
-WHERE f.code =~ '(?i).*{regex_like}.*'
-RETURN f.code AS code, f.stat AS stat
-ORDER BY code
-LIMIT 200;
-""".strip()
-
-def cy_count_subjects() -> str:
-    return """
-MATCH (s:Subject)
-RETURN
-  sum(CASE WHEN s.pid STARTS WITH 'ASD:' THEN 1 ELSE 0 END) AS asd_cases,
-  sum(CASE WHEN s.pid STARTS WITH 'TD:'  THEN 1 ELSE 0 END) AS td_cases;
 """.strip()
 
 # ----------------------- NL engine -----------------------
