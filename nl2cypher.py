@@ -8,13 +8,14 @@ NL → Cypher for ASD Gait graph with JSON-backed catalog.
   - nodes.ndjson.gz  (μία γραμμή/κόμβος: {"eid","labels","props"})
 
 Ο GraphCatalog διαβάζει ΜΟΝΟ τους κόμβους Feature & Subject και συνάγει:
-  - joints από f.props.joint_guess (π.χ. "hip","knee"...)
+  - joints από f.props.joint_guess (π.χ. "hip","knee"...), ΑΛΛΑ έχουμε και fallback σε stem του code
   - διαθέσιμες πλευρές ανά joint (L/R) από κατάληξη f.props.code
   - διαθέσιμα stats ανά joint (mean/std/var) από f.props.stat
   - πλήθος Subjects ανά ομάδα (ASD/TD) από s.props.pid prefix
 
 Το NL2Cypher παράγει Cypher με:
-  - `joint_guess` + L/R στο `Feature.code` (ασφαλές & συμβατό με το σχήμα σου)
+  - φίλτρο joint ως: (joint_guess==joint) **ή** code-stem (π.χ. HIAN για knee)
+  - side φίλτρο με regex `…L$` ή `…R$` (κρατάμε την επιλογή χρήστη ακόμη κι αν ο κατάλογος δεν ξέρει πλευρές)
   - single WHERE (όχι διπλά WHERE)
   - προαιρετικό Ollama fallback (USE_LLM=true) μόνο αν δεν βρεθεί σαφής κανόνας.
 """
@@ -176,6 +177,15 @@ JOINT_ALIASES: Dict[str, List[str]] = {
     "pelvis": ["pelvis", "λεκ", "πυελ"],
 }
 
+# stem ανά joint για fallback όταν λείπει/δεν ταιριάζει το joint_guess
+JOINT_CODE_STEM = {
+    "knee": "HIAN",
+    "hip": "SPKN",
+    "ankle": "KNFO",
+    "trunk": "THHTI",
+    # πρόσθεσε αν γνωρίζεις stems για spine/pelvis
+}
+
 def _detect_cond(q: str) -> str:
     t = q.lower()
     if "asd" in t or "αυτισ" in t: return "ASD"
@@ -184,15 +194,15 @@ def _detect_cond(q: str) -> str:
 
 def _detect_side(q: str) -> str:
     t = q.lower()
-    if re.search(r"\b(right|δεξ|dexi| r\b)", t): return "R"
-    if re.search(r"\b(left|αριστ| l\b)", t): return "L"
+    if re.search(r"\b(right|δεξ|dexi|\br\b)", t): return "R"
+    if re.search(r"\b(left|αριστ|\bl\b)", t): return "L"
     return "BOTH"
 
 def _detect_joint(q: str, catalog: GraphCatalog) -> Optional[str]:
     t = q.lower()
     for canon, aliases in JOINT_ALIASES.items():
         if any(a in t for a in aliases):
-            return canon if catalog.has_joint(canon) else None
+            return canon if (catalog.has_joint(canon) or canon in JOINT_CODE_STEM) else None
     for j in sorted(catalog.joints):
         if j in t:
             return j
@@ -213,7 +223,18 @@ def _detect_intent(q: str) -> str:
     if "mean" in t or "average" in t or "μ.ο" in t or "μέση" in t: return "mean"
     return "mean"
 
-# ---------- Cypher templates (single WHERE) ----------
+# ---------- Joint filter helper (joint_guess OR code stem) ----------
+
+def _joint_filter(joint: str) -> str:
+    stem = JOINT_CODE_STEM.get(joint.lower(), "")
+    if stem:
+        return (
+            f"( (exists(f.joint_guess) AND toLower(f.joint_guess)='{joint.lower()}') "
+            f"OR f.code =~ '(?i).*{stem}.*' )"
+        )
+    return f"(exists(f.joint_guess) AND toLower(f.joint_guess)='{joint.lower()}')"
+
+# ---------- Cypher templates ----------
 
 TEMPLATES = {
     "count": "MATCH (s:Subject) RETURN sum(CASE WHEN s.pid STARTS WITH 'ASD:' THEN 1 ELSE 0 END) AS asd_cases, sum(CASE WHEN s.pid STARTS WITH 'TD:' THEN 1 ELSE 0 END) AS td_cases;",
@@ -244,11 +265,9 @@ ORDER BY condition, side;""",
     "compare_asd_td": """
 UNWIND {sides} AS side
 MATCH (s:Subject)-[:HAS_TRIAL]->(:Trial)-[:HAS_FEATURE]->(fv:FeatureValue)-[:OF_FEATURE]->(f:Feature)
-WHERE f.stat='{stat}' AND (
-  (toLower(f.joint_guess)='{joint}' AND (
-     (side='L' AND f.code =~ '(?i).*L\\s*$') OR
-     (side='R' AND f.code =~ '(?i).*R\\s*$')
-  ))
+WHERE f.stat='{stat}' AND {joint_filter} AND (
+  (side='L' AND f.code =~ '(?i).*L\\s*$') OR
+  (side='R' AND f.code =~ '(?i).*R\\s*$')
 )
   AND s.pid STARTS WITH 'ASD:'
 WITH 'ASD' AS cond, side, avg(fv.value) AS avg_val
@@ -256,11 +275,9 @@ RETURN cond, side, avg_val
 UNION ALL
 UNWIND {sides} AS side
 MATCH (s:Subject)-[:HAS_TRIAL]->(:Trial)-[:HAS_FEATURE]->(fv:FeatureValue)-[:OF_FEATURE]->(f:Feature)
-WHERE f.stat='{stat}' AND (
-  (toLower(f.joint_guess)='{joint}' AND (
-     (side='L' AND f.code =~ '(?i).*L\\s*$') OR
-     (side='R' AND f.code =~ '(?i).*R\\s*$')
-  ))
+WHERE f.stat='{stat}' AND {joint_filter} AND (
+  (side='L' AND f.code =~ '(?i).*L\\s*$') OR
+  (side='R' AND f.code =~ '(?i).*R\\s*$')
 )
   AND s.pid STARTS WITH 'TD:'
 WITH 'TD' AS cond, side, avg(fv.value) AS avg_val
@@ -271,7 +288,7 @@ ORDER BY cond, side;"""
 # ---------- Engine ----------
 
 class NL2Cypher:
-    """Φτιάχνει Cypher αξιοποιώντας GraphCatalog από JSON export του γράφου."""
+    """Φτιάχνει Cypher αξιοποιώντας GraphCatalog από JSON export του γράφου + stem fallback."""
 
     def __init__(self, data_dir: Optional[str] = None, nodes_file: Optional[str] = None, catalog: Optional[GraphCatalog] = None):
         if catalog is not None:
@@ -286,7 +303,7 @@ class NL2Cypher:
         if not q:
             return "MATCH (n) RETURN count(n) AS nodes LIMIT 1;"
 
-        # 1) κανόνες πάνω στον κατάλογο (exact)
+        # Κανόνες πάνω στον κατάλογο (και με stem fallback)
         intent = _detect_intent(q)
         cond = _detect_cond(q)
         side = _detect_side(q)
@@ -303,39 +320,31 @@ class NL2Cypher:
         if intent == "compare":
             sides_val = "['L','R']" if side == "BOTH" else f"['{side}']"
             return TEMPLATES["compare_asd_td"].format(
-                sides=sides_val, stat=stat, joint=joint
+                sides=sides_val, stat=stat, joint_filter=_joint_filter(joint)
             ).strip()
 
         # default: mean
-        # προσαρμογή πλευράς σύμφωνα με το τι υπάρχει στον γράφο
-        sides_avail = self.catalog.available_sides(joint)
-        if side in ("L","R") and side not in sides_avail:
-            side = "BOTH"
+        where_parts = []
+        if cond != "BOTH":
+            where_parts.append(f"s.pid STARTS WITH '{cond}:'")
+        where_parts.append(f"f.stat='{stat}'")
+
+        jf = _joint_filter(joint)
 
         if side == "BOTH":
-            where_parts = []
-            if cond != "BOTH":
-                where_parts.append(f"s.pid STARTS WITH '{cond}:'")
-            where_parts.append(f"f.stat='{stat}'")
-            where_parts.append(
-                f"(toLower(f.joint_guess)='{joint}' AND (f.code =~ '(?i).*L\\s*$' OR f.code =~ '(?i).*R\\s*$'))"
-            )
-            where_clause = " AND ".join(where_parts)
+            where_parts.append(f"{jf} AND (f.code =~ '(?i).*L\\s*$' OR f.code =~ '(?i).*R\\s*$')")
             side_expr = "CASE WHEN f.code =~ '(?i).*L\\s*$' THEN 'L' ELSE 'R' END"
-            return TEMPLATES["mean"].format(where_clause=where_clause, side_expr=side_expr).strip()
         else:
-            where_parts = []
-            if cond != "BOTH":
-                where_parts.append(f"s.pid STARTS WITH '{cond}:'")
-            where_parts.append(f"f.stat='{stat}'")
-            where_parts.append(
-                f"(toLower(f.joint_guess)='{joint}' AND f.code =~ '(?i).*{side}\\s*$')"
-            )
-            where_clause = " AND ".join(where_parts)
+            where_parts.append(f"{jf} AND f.code =~ '(?i).*{side}\\s*$'")
             side_expr = f"'{side}'"
-            return TEMPLATES["mean"].format(where_clause=where_clause, side_expr=side_expr).strip()
+
+        where_clause = " AND ".join(where_parts)
+        return TEMPLATES["mean"].format(where_clause=where_clause, side_expr=side_expr).strip()
 
     def _fallback_joint(self) -> str:
+        # Αν δεν ανέφερε joint, ξεκίνα με knee αν υπάρχει stem, αλλιώς με ό,τι υπάρχει στον κατάλογο
+        if "knee" in JOINT_CODE_STEM:
+            return "knee"
         if "knee" in self.catalog.joints:
             return "knee"
         return next(iter(sorted(self.catalog.joints)), "knee")

@@ -88,7 +88,9 @@ try:
     if reload_catalog:
         load_catalog_cached.clear()
     catalog = load_catalog_cached(data_dir)
-    st.sidebar.success(f"Catalog ✓ joints: {len(catalog.joints)}")
+    found_nodes = os.path.exists(os.path.join(data_dir, "nodes.ndjson.gz"))
+    badge = "✅ Found" if found_nodes else "❌ Missing"
+    st.sidebar.success(f"Catalog {badge} nodes.ndjson.gz — joints: {len(catalog.joints)}")
     st.sidebar.caption(f"Subjects — ASD: {catalog.subject_counts['ASD']} | TD: {catalog.subject_counts['TD']}")
 except Exception as e:
     st.sidebar.error("Catalog failed to load")
@@ -221,9 +223,9 @@ with tabs[3]:
     st.markdown(
         "- **Connect** to Neo4j from the sidebar (URI, user, password). A green badge confirms connection.\n"
         "- **Catalog**: set folder containing `nodes.ndjson.gz` and click **Reload catalog**. "
-        "NL→Cypher uses this catalog (joint_guess/sides/stats) so queries match your actual graph.\n"
+        "NL→Cypher uses this catalog (joint_guess/sides/stats and stem fallback) so queries match your actual graph.\n"
         "- **Ask (NL → Cypher):** Type a question and press *Generate* or *Generate & Execute*. "
-        "The app produces Cypher aligned with your schema using `joint_guess` + side suffix.\n"
+        "The app produces Cypher aligned with your schema using `joint_guess` OR `code` stem + side suffix.\n"
         "- **Query (Cypher):** Run read-only queries. Write operations (CREATE/MERGE/DELETE/SET/LOAD CSV…) are blocked unless you enable **Allow write**.\n"
         "- **Reports:** One-click completeness & correlations summaries.\n"
         "- **Remote use:** If running on a remote server, use SSH port-forwarding and open http://localhost:8504 on your laptop."
