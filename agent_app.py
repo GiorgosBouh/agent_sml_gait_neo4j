@@ -19,7 +19,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import streamlit as st
 import pandas as pd
-from neo4j import GraphDatabase, basic_auth, exceptions as neo4j_ex, Driver
+from neo4j import GraphDatabase, basic_auth, Driver
 
 # Optional: import the rule-based NL→Cypher engine you created earlier.
 # If it's missing, we keep a local lightweight generator below.
@@ -59,7 +59,8 @@ def run_query(driver: Driver, cypher: str, params: Optional[Dict[str, Any]] = No
         return [dict(r) for r in result]
 
 def to_df(rows: List[Dict[str, Any]]) -> pd.DataFrame:
-    if not rows: return pd.DataFrame()
+    if not rows:
+        return pd.DataFrame()
     norm = []
     for r in rows:
         norm.append({k: json.dumps(v, ensure_ascii=False) if isinstance(v, (list, dict)) else v for k, v in r.items()})
@@ -404,9 +405,26 @@ LIMIT {limit};
                 st.exception(e)
 
 # Tab 4 — Help
+# Tab 4 — Help
 with tabs[3]:
     st.subheader("ℹ️ How to use")
     st.markdown("""
 - **Connect** to Neo4j from the sidebar (URI, user, password). You should see a green “Connected”.
 - **Ask (NL → Cypher):** Type a question and press *Generate* or *Generate & Execute*.
   The app produces Cypher aligned with your schema:
+
+  (:Subject)-[:HAS_TRIAL]->(:Trial)-[:HAS_FILE]->(:File)  
+  (:Trial)-[:HAS_FEATURE]->(:FeatureValue)-[:OF_FEATURE]->(:Feature)  
+
+  Conditions are inferred from `Subject.pid` prefix (`ASD:` / `TD:`).
+
+- **Query (Cypher):** Run read-only queries. Write operations (CREATE/MERGE/DELETE/SET/LOAD CSV…) are blocked unless you enable **Allow write**.
+
+- **Reports:** One-click completeness & correlations summaries.
+
+- **Remote use:** If running on a remote server, use SSH port-forwarding:
+
+  ssh -L 8504:localhost:8504 ilab@YOUR_SERVER_IP  
+
+  then open http://localhost:8504 on your laptop.
+    """)
