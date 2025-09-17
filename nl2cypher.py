@@ -1,223 +1,241 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-import os
+
+"""
+Rule-based NL → Cypher for ASD Gait graph.
+
+Graph schema (as provided):
+  (:Subject {pid,sid})-[:HAS_TRIAL]->(:Trial {uid})
+  (:Trial)-[:HAS_FILE]->(:File {uid,kind})
+  (:Trial)-[:HAS_FEATURE]->(:FeatureValue {value})-[:OF_FEATURE]->(:Feature {code,stat})
+
+This module exposes:
+  class NL2Cypher:
+      def to_cypher(self, question: str) -> str
+"""
+
 import re
-import json
-from typing import Dict, Any, List, Optional
+from typing import Dict, Tuple, Optional
 
-# Προαιρετικά μπορείς να απενεργοποιήσεις το SLM με env: NL2CYPHER_DISABLE_LLM=1
-DISABLE_LLM = os.getenv("NL2CYPHER_DISABLE_LLM", "0") == "1"
+# ----------------------- Dictionaries -----------------------
+JOINT_STEMS: Dict[str, Tuple[str, str]] = {
+    # keyword → (feature code stem, nice name)
+    "knee": ("HIAN", "Knee"),
+    "γόνα": ("HIAN", "Knee"),
+    "gonato": ("HIAN", "Knee"),
+    "ankle": ("KNFO", "Ankle"),
+    "ποδοκν": ("KNFO", "Ankle"),
+    "hip": ("SPKN", "Hip"),
+    "ισχ": ("SPKN", "Hip"),
+    "trunk": ("THHTI", "TrunkTilt"),
+    "κορμ": ("THHTI", "TrunkTilt"),
+    "spine": ("SPINE", "Spine"),
+    "pelvis": ("SPEL", "Pelvis"),
+}
 
-# Default μικρό SLM. Μπορείς να αλλάξεις με env: NL2CYPHER_MODEL=...
-DEFAULT_MODEL = os.getenv("NL2CYPHER_MODEL", "google/flan-t5-small")
+SPATIOTEMPORAL: Dict[str, Tuple[str, str]] = {
+    # label → (Feature.code, unit)
+    "velocity": ("Velocity", "m/s"),
+    "stance": ("StaT", "ms"),
+    "swing": ("SwiT", "ms"),
+    "gait cycle": ("GaCT", "ms"),
+    "stride length": ("StrLe", "m"),
+    "step length": ("MaxStLe", "m"),
+    "step width": ("MaxStWi", "m"),
+}
 
-# ---------------------- I/O helpers ----------------------
-def load_json(path: str) -> Any:
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+# ----------------------- Helpers -----------------------
+def detect_condition(q: str) -> str:
+    uq = q.lower()
+    if re.search(r"\basd\b.*(vs|and|&|,)\s*\btd\b", uq) or re.search(r"\btd\b.*(vs|and|&|,)\s*\basd\b", uq):
+        return "BOTH"
+    if "asd" in uq or "αυτισ" in uq:
+        return "ASD"
+    if re.search(r"\btd\b", uq) or "τυπικ" in uq or "control" in uq:
+        return "TD"
+    return "BOTH"
 
-def normalize_greek(text: str) -> str:
-    t = (text or "").strip().lower()
-    repl = {
-        "ά":"α","έ":"ε","ή":"η","ί":"ι","ό":"ο","ύ":"υ","ώ":"ω",
-        "ϊ":"ι","ΐ":"ι","ϋ":"υ","ΰ":"υ"
-    }
-    for a,b in repl.items():
-        t = t.replace(a,b)
-    return t
+def detect_side(q: str) -> str:
+    uq = q.lower()
+    if re.search(r"\b(left|αριστερ(?:ά|η)|αρ\.)\b", uq): return "L"
+    if re.search(r"\b(right|δεξι(?:ά|ή)|δε\.)\b", uq): return "R"
+    return "BOTH"
 
-def apply_synonyms(text: str, syn: Dict[str,str]) -> str:
-    t = normalize_greek(text)
-    for k,v in (syn or {}).items():
-        t = re.sub(rf"\b{re.escape(k)}\b", v, t)
-    return t
-
-# ---------------------- deterministic routing ----------------------
-def detect_intent(text: str, intents: List[Dict[str, Any]]) -> Optional[str]:
-    t = text.lower()
-    for item in intents or []:
-        intent = item.get("intent")
-        for pat in item.get("patterns", []):
-            try:
-                if re.search(pat, t):
-                    return intent
-            except re.error:
-                # Αγνόησε τυχόν κακό regex
-                continue
+def detect_joint(q: str) -> Optional[Tuple[str, str]]:
+    uq = q.lower()
+    for key, (stem, name) in JOINT_STEMS.items():
+        if key in uq:
+            return stem, name
     return None
 
-def extract_entities(text: str, feat: Dict[str, Any]) -> Dict[str, Optional[str]]:
-    t = text.lower()
+def spatiotemporal_key(q: str) -> Optional[str]:
+    uq = q.lower()
+    for label in SPATIOTEMPORAL.keys():
+        if label in uq or label.replace(" ", "") in uq:
+            return label
+    return None
 
-    # condition
-    cond = None
-    if re.search(r"\b(asd)\b", t): cond = "ASD"
-    elif re.search(r"\b(td|typical|control|τυπικ)\b", t): cond = "TD"
-
-    # side
-    side = None
-    if re.search(r"\b(left|αρισ|αρ\.)\b", t): side = "L"
-    elif re.search(r"\b(right|δεξ|δεξ\.)\b", t): side = "R"
-
-    # joint
-    joint = None
-    joint_aliases = (feat or {}).get("joint_aliases", {})
-    for k, vals in joint_aliases.items():
-        if any(v in t for v in vals):
-            joint = k
-            break
-
-    # metric/stat
-    stat = None
-    metrics = (feat or {}).get("metrics", {})
-    for k, v in metrics.items():
-        if re.search(rf"\b{k}\b", t):
-            stat = v
-            break
-
-    # code regex από joint/side
-    code_regex = None
-    if joint and side:
-        code_key = f"{joint}_{side}"
-        code_regex = (feat or {}).get("code_regex", {}).get(code_key)
-
-    return {"cond": cond, "side": side, "joint": joint, "stat": stat, "code_regex": code_regex}
-
-def fill_template(intent: str, ent: Dict[str, Optional[str]], templates: Dict[str, str]) -> str:
-    if intent not in templates:
-        return ""
-    # defaults ασφαλείας
-    d = {
-        "cond": ent.get("cond") or "ASD",
-        "side": ent.get("side") or "R",
-        "joint": (ent.get("joint") or "knee").title(),
-        "stat": ent.get("stat") or "mean",
-        "code_regex": ent.get("code_regex") or "(?i).*HIANR\\s*$"
-    }
-    try:
-        return templates[intent].format(**d)
-    except KeyError:
-        return ""
-
-# ---------------------- prompt building (LLM fallback) ----------------------
-def _truncate_fewshots(fewshots: List[Dict[str,str]], max_chars: int = 1200) -> List[Dict[str,str]]:
-    out, total = [], 0
-    for ex in fewshots or []:
-        block = f"Q: {ex.get('q','')}\nCypher:\n{ex.get('cypher','')}\n---\n"
-        if total + len(block) > max_chars:
-            break
-        out.append(ex)
-        total += len(block)
-    return out
-
-def build_fewshot_prompt(user_q: str, fewshots: List[Dict[str,str]]) -> str:
-    few = _truncate_fewshots(fewshots, max_chars=1200)
-    lines = []
-    lines.append("Task: Convert the user question to a valid Cypher query for a Neo4j gait knowledge graph.")
-    lines.append("Only output Cypher (no prose, no numbering, no markdown).")
-    lines.append("Graph schema summary:")
-    lines.append("- Subject(pid) -[:HAS_CONDITION]-> Condition(name in ['ASD','TD'])")
-    lines.append("- Subject -[:HAS_SAMPLE]-> Sample(sample_id, row, class, trial_idx)")
-    lines.append("- Sample -[:HAS_VALUE]-> FeatureValue(value) -[:OF_FEATURE]-> Feature(code, stat)")
-    lines.append("Feature codes examples: HIAN(L/R)=Knee angle, KNFO(L/R)=Ankle angle, THHTI(L/R)=Trunk tilt, SPKN(L/R)=Hip.")
-    lines.append("Use mean/std/variance as Feature.stat and case-insensitive regex for codes, e.g. '(?i).*HIANR\\s*$'.")
-    lines.append("")
-    for ex in few:
-        lines.append(f"Q: {ex.get('q','')}\nCypher:\n{ex.get('cypher','')}\n---")
-    uq = (user_q or "").strip()
-    if len(uq) > 600:
-        uq = uq[:600]
-    lines.append(f"Q: {uq}\nCypher:\n")
-    return "\n".join(lines)
-
-# ---------------------- sanitization & validation ----------------------
-CY_START_RE = re.compile(r'(?is)\b(MATCH|WITH|CALL|UNWIND|CREATE|MERGE|RETURN)\b')
-CY_VALID_START = re.compile(r'(?is)^\s*(MATCH|WITH|CALL|UNWIND|CREATE|MERGE|RETURN)\b')
-
-def _sanitize_to_cypher(text: str) -> str:
-    if not text:
-        return ""
-    # strip code fences & labels
-    text = re.sub(r"```.*?```", "", text, flags=re.S)
-    text = re.sub(r"^```(?:cypher)?", "", text.strip(), flags=re.I)
-    text = re.sub(r"```$", "", text.strip())
-    text = re.sub(r'(?i)^\s*(cypher|query)\s*:\s*', '', text).strip()
-    text = re.sub(r'^\s*\d+[\)\.]?\s*', '', text)
-    # keep from first cypher keyword
-    m = CY_START_RE.search(text)
+def feature_regex_from_text(q: str) -> Optional[str]:
+    m = re.search(r"(features?|codes?|χαρακτηριστικ\w*|κωδικ\w*)\s*(?:like|όπως|=|regex)\s*([A-Za-z0-9\-\_\.\\\*]+)", q, flags=re.IGNORECASE)
     if m:
-        text = text[m.start():]
-    return text.strip()
+        return m.group(2).replace("*", ".*")
+    return None
 
-def looks_like_cypher(s: str) -> bool:
-    return bool(s and CY_VALID_START.search(s.strip()))
+def asks_coupling(q: str) -> Optional[Tuple[str, str]]:
+    uq = q.lower()
+    if "coupling" in uq or "συσχέτι" in uq or "correlat" in uq or "regress" in uq:
+        # best-effort: find two joints
+        keys = [k for k in JOINT_STEMS.keys() if k in uq]
+        if len(keys) >= 2:
+            a = JOINT_STEMS[keys[0]][0]
+            b = JOINT_STEMS[keys[1]][0]
+            return a, b
+        # default Knee→Ankle
+        return "HIAN", "KNFO"
+    return None
 
-# ---------------------- NL2Cypher core ----------------------
+# ----------------------- Cypher templates -----------------------
+def cy_unwind_sides(side: str) -> str:
+    return "WITH CASE WHEN '{s}'='BOTH' THEN ['L','R'] ELSE ['{s}'] END AS sides\nUNWIND sides AS side".format(s=side)
+
+def cy_mean_per_subject(cond: str, side: str, joint_stem: str, stat: str = "mean") -> str:
+    if side == "BOTH":
+        side_filter = f"(f.code =~ '(?i).*{joint_stem}L\\s*$' OR f.code =~ '(?i).*{joint_stem}R\\s*$')"
+        side_expr = "CASE WHEN f.code =~ '(?i).*L\\s*$' THEN 'L' ELSE 'R' END"
+    else:
+        side_filter = f"f.code =~ '(?i).*{joint_stem}{side}\\s*$'"
+        side_expr = f"'{side}'"
+    cond_case = "CASE WHEN s.pid STARTS WITH 'ASD:' THEN 'ASD' WHEN s.pid STARTS WITH 'TD:' THEN 'TD' ELSE 'UNK' END"
+    cond_filter = "" if cond == "BOTH" else f"WHERE s.pid STARTS WITH '{cond}:'"
+    return f"""
+MATCH (s:Subject)-[:HAS_TRIAL]->(:Trial)-[:HAS_FEATURE]->(fv:FeatureValue)-[:OF_FEATURE]->(f:Feature)
+{cond_filter}
+WHERE f.stat='{stat}' AND {side_filter}
+WITH {cond_case} AS condition, {side_expr} AS side, s.pid AS pid, avg(fv.value) AS subj_mean
+RETURN condition, side, round(avg(subj_mean),2) AS mean_value, count(*) AS n
+ORDER BY condition, side;
+""".strip()
+
+def cy_spatiotemporal_mean(cond: str, feature_code: str) -> str:
+    cond_case = "CASE WHEN s.pid STARTS WITH 'ASD:' THEN 'ASD' WHEN s.pid STARTS WITH 'TD:' THEN 'TD' ELSE 'UNK' END"
+    cond_filter = "" if cond == "BOTH" else f"WHERE s.pid STARTS WITH '{cond}:'"
+    return f"""
+MATCH (s:Subject)-[:HAS_TRIAL]->(:Trial)-[:HAS_FEATURE]->(fv:FeatureValue)-[:OF_FEATURE]->(f:Feature {{code:'{feature_code}'}})
+{cond_filter}
+WITH {cond_case} AS condition, s.pid AS pid, avg(fv.value) AS subj_mean
+RETURN condition, round(avg(subj_mean),3) AS mean_value, count(*) AS n
+ORDER BY condition;
+""".strip()
+
+def cy_compare_groups(code_pattern: str, stat: str = "mean") -> str:
+    return f"""
+UNWIND ['ASD','TD'] AS grp
+MATCH (s:Subject)-[:HAS_TRIAL]->(:Trial)-[:HAS_FEATURE]->(fv:FeatureValue)-[:OF_FEATURE]->(f:Feature)
+WHERE s.pid STARTS WITH grp + ':' AND f.stat='{stat}' AND f.code =~ '(?i).*{code_pattern}\\s*$'
+WITH grp AS condition, s.pid AS pid, avg(fv.value) AS subj_mean
+RETURN condition, round(avg(subj_mean),3) AS mean_value, count(*) AS n
+ORDER BY condition;
+""".strip()
+
+def cy_coupling_ols(cond: str, side: str, a_stem: str, b_stem: str) -> str:
+    cond_case = "CASE WHEN s.pid STARTS WITH 'ASD:' THEN 'ASD' WHEN s.pid STARTS WITH 'TD:' THEN 'TD' ELSE 'UNK' END"
+    cond_filter = "" if cond == "BOTH" else f"WHERE s.pid STARTS WITH '{cond}:'"
+    return f"""
+{cy_unwind_sides(side)}
+WITH side, '{a_stem}' AS a_stem, '{b_stem}' AS b_stem
+MATCH (s:Subject)-[:HAS_TRIAL]->(:Trial)-[:HAS_FEATURE]->(av:FeatureValue)-[:OF_FEATURE]->(af:Feature)
+{cond_filter}
+WHERE af.stat='mean' AND af.code =~ ('(?i).*' + a_stem + side + '\\s*$')
+MATCH (s)-[:HAS_TRIAL]->(:Trial)-[:HAS_FEATURE]->(bv:FeatureValue)-[:OF_FEATURE]->(bf:Feature)
+WHERE bf.stat='mean' AND bf.code =~ ('(?i).*' + b_stem + side + '\\s*$')
+WITH {cond_case} AS condition, side, s.pid AS pid, avg(av.value) AS A, avg(bv.value) AS B
+WITH condition, side, collect({{a:A, b:B}}) AS pairs
+UNWIND pairs AS p
+WITH condition, side,
+     count(*) AS n,
+     sum(p.a) AS sa, sum(p.b) AS sb,
+     sum(p.a*p.b) AS sab,
+     sum(p.a*p.a) AS saa, sum(p.b*p.b) AS sbb
+WITH condition, side, n, sa, sb, sab, saa, sbb,
+     (n*saa - sa*sa) AS denom,
+     (n*sab - sa*sb) AS num,
+     (n*sbb - sb*sb) AS Syy
+RETURN condition, side, n,
+       round(CASE WHEN denom<>0 THEN num/denom ELSE null END,4) AS beta,
+       round(CASE WHEN denom>0 AND Syy>0 THEN (num*num)/(denom*Syy) ELSE null END,4) AS R2
+ORDER BY condition, side;
+""".strip()
+
+def cy_list_features(regex_like: str) -> str:
+    return f"""
+MATCH (f:Feature)
+WHERE f.code =~ '(?i).*{regex_like}.*'
+RETURN f.code AS code, f.stat AS stat
+ORDER BY code
+LIMIT 200;
+""".strip()
+
+def cy_count_subjects() -> str:
+    return """
+MATCH (s:Subject)
+RETURN
+  sum(CASE WHEN s.pid STARTS WITH 'ASD:' THEN 1 ELSE 0 END) AS asd_cases,
+  sum(CASE WHEN s.pid STARTS WITH 'TD:'  THEN 1 ELSE 0 END) AS td_cases;
+""".strip()
+
+# ----------------------- NL engine -----------------------
 class NL2Cypher:
-    def __init__(self, model_name: Optional[str] = None):
-        self.intents = load_json("intents.json")
-        self.feat = load_json("features.json")
-        self.templates = load_json("templates.json")
-
-        self.llm = None
-        if not DISABLE_LLM:
-            from transformers import pipeline  # lazy import
-            model_name = model_name or DEFAULT_MODEL
-            self.llm = pipeline(
-                "text2text-generation",
-                model=model_name,
-                max_new_tokens=220,
-                do_sample=False,
-                temperature=0.0
-            )
-
-    def _deterministic_route(self, user_q: str) -> str:
-        """Πρώτα προσπαθεί με intents + templates. Αν όλα καλά, γυρίζει καθαρό Cypher."""
-        intent = detect_intent(user_q or "", self.intents)
-        if not intent:
-            return ""
-        ent = extract_entities(user_q or "", self.feat)
-        cy = fill_template(intent, ent, self.templates)
-        return cy or ""
-
-    def _llm_fallback(self, user_q: str, fewshots: List[Dict[str,str]]) -> str:
-        """Χρήση μικρού SLM μόνο ως έσχατη λύση, με αυστηρό sanitize/validate."""
-        if not self.llm:
-            return ""
-        prompt = build_fewshot_prompt(user_q or "", fewshots or [])
-        raw = self.llm(prompt)[0]["generated_text"]
-        cy = _sanitize_to_cypher(raw)
-        if not looks_like_cypher(cy):
-            return ""
-        return cy
-    def __init__(self):
+    """
+    Minimal, deterministic NL → Cypher engine.
+    Usage:
+        engine = NL2Cypher()
+        cypher = engine.to_cypher("compare ASD vs TD knee right mean")
+    """
+    def __init__(self) -> None:
         pass
 
     def to_cypher(self, question: str) -> str:
-        # placeholder: μπορείς να καλέσεις το generate_cypher_local εδώ
-        cypher, _ = generate_cypher_local(question)
-        return cypher
+        q = (question or "").strip()
+        if not q:
+            return "MATCH (n) RETURN count(n) AS nodes LIMIT 1;"
 
-    def __call__(self, user_q: str, synonyms: Dict[str,str], fewshots: List[Dict[str,str]]) -> str:
-        # 1) Normalize + synonyms
-        nq = apply_synonyms(user_q or "", synonyms or {})
+        # counts
+        if re.search(r"\b(count|how many|πόσα)\b.*\b(asd|td|subjects|participants|cases)\b", q, flags=re.IGNORECASE):
+            return cy_count_subjects()
 
-        # 2) Deterministic routing (intents/templates)
-        cy = self._deterministic_route(nq)
-        if looks_like_cypher(cy):
-            return cy
+        # list features like/regex
+        rgx = feature_regex_from_text(q)
+        if rgx:
+            return cy_list_features(rgx)
 
-        # 3) Heuristic very-shortcuts (π.χ. mean knee ASD με έτοιμο fewshot)
-        #if re.search(r"(?i)\bmean\b.*\bHIAN", nq) and re.search(r"(?i)\bASD\b", nq):
-            #for ex in fewshots or []:
-               # c = ex.get("cypher","")
-                #if "HIAN" in c and "ASD" in c:
-                    #return c
+        # spatiotemporal
+        sp = spatiotemporal_key(q)
+        if sp:
+            cond = detect_condition(q)
+            code, _unit = SPATIOTEMPORAL[sp]
+            return cy_spatiotemporal_mean(cond, code)
 
-        # 4) LLM fallback (strict sanitize)
-        cy = self._llm_fallback(nq, fewshots)
-        if looks_like_cypher(cy):
-            return cy
+        # coupling/regression between joints
+        cp = asks_coupling(q)
+        if cp:
+            cond = detect_condition(q)
+            side = detect_side(q)
+            a_stem, b_stem = cp
+            return cy_coupling_ols(cond, side, a_stem, b_stem)
 
-        # 5) Τελικό: δώσε κενό ώστε το app να κάνει rule-based fallback στη μεριά του UI
-        return ""
+        # compare ASD vs TD for a joint (optionally side)
+        if re.search(r"(compare|vs|diff|σύγκρι|διαφορ)", q, flags=re.IGNORECASE):
+            side = detect_side(q)
+            js = detect_joint(q) or ("HIAN", "Knee")
+            code_pat = f"{js[0]}{'' if side=='BOTH' else side}"
+            return cy_compare_groups(code_pat)
+
+        # mean for joint by side/cond
+        if re.search(r"(mean|avg|average|μ\.?ο\.?|μέση)", q, flags=re.IGNORECASE) or detect_joint(q):
+            cond = detect_condition(q)
+            side = detect_side(q)
+            js = detect_joint(q) or ("HIAN", "Knee")
+            return cy_mean_per_subject(cond, side, js[0], "mean")
+
+        # fallback
+        return "MATCH (n) RETURN count(n) AS nodes LIMIT 1;"
