@@ -2,27 +2,219 @@
 # -*- coding: utf-8 -*-
 
 """
-NL → Cypher for ASD Gait graph with hybrid logic:
-- Rule-based exact matches first (fast, deterministic).
-- If no exact match, fallback to FREE local small language model (Ollama).
-- If LLM not reachable, fallback to noop query.
+NL → Cypher for ASD Gait graph with JSON-backed catalog.
 
-Schema:
-  (:Subject {pid,sid})-[:HAS_TRIAL]->(:Trial {uid})
-  (:Trial)-[:HAS_FILE]->(:File {uid,kind})
-  (:Trial)-[:HAS_FEATURE]->(:FeatureValue {value})-[:OF_FEATURE]->(:Feature {code,stat})
+Χρησιμοποιεί τα αρχεία export του γράφου:
+  - nodes.ndjson.gz  (μία γραμμή/κόμβος: {"eid","labels","props"})
+
+Ο GraphCatalog διαβάζει ΜΟΝΟ τους κόμβους Feature & Subject και συνάγει:
+  - joints από f.props.joint_guess (π.χ. "hip","knee"...)
+  - διαθέσιμες πλευρές ανά joint (L/R) από κατάληξη f.props.code
+  - διαθέσιμα stats ανά joint (mean/std/var) από f.props.stat
+  - πλήθος Subjects ανά ομάδα (ASD/TD) από s.props.pid prefix
+
+Το NL2Cypher παράγει Cypher με:
+  - `joint_guess` + L/R στο `Feature.code` (ασφαλές & συμβατό με το σχήμα σου)
+  - single WHERE (όχι διπλά WHERE)
+  - προαιρετικό Ollama fallback (USE_LLM=true) μόνο αν δεν βρεθεί σαφής κανόνας.
 """
 
-import os, re, json, requests
-from typing import Dict, Any, Optional
+import os
+import re
+import json
+import gzip
+from typing import Dict, Any, Optional, Set, Tuple, List
 
-# ------------------- Config -------------------
-USE_LLM = str(os.getenv("USE_LLM", "false")).lower() in ("1","true","yes")
+# ---------- Optional LLM (Ollama) ----------
+import requests
+USE_LLM = str(os.getenv("USE_LLM", "false")).lower() in ("1", "true", "yes", "on")
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:3b-instruct")
-OLLAMA_TIMEOUT = float(os.getenv("OLLAMA_TIMEOUT", "12.0"))
+OLLAMA_TIMEOUT = float(os.getenv("OLLAMA_TIMEOUT", "8.0"))
 
-# ------------------- Templates -------------------
+_SYS_PROMPT = """You extract structured slots from a short clinical gait query.
+Return ONLY strict JSON with keys:
+{"intent":"mean|compare|count|correlations|completeness",
+ "joint":"knee|hip|ankle|trunk|spine|pelvis",
+ "side":"L|R|BOTH",
+ "cond":"ASD|TD|BOTH",
+ "stat":"mean|std|var"}"""
+
+def _ollama_generate(prompt: str) -> Optional[str]:
+    if not USE_LLM:
+        return None
+    try:
+        r = requests.post(
+            f"{OLLAMA_URL}/api/generate",
+            json={"model": OLLAMA_MODEL, "prompt": prompt, "stream": False},
+            timeout=OLLAMA_TIMEOUT,
+        )
+        if r.status_code == 200:
+            return r.json().get("response", "").strip()
+    except Exception:
+        pass
+    return None
+
+def _llm_parse_slots(question: str) -> Optional[Dict[str, str]]:
+    resp = _ollama_generate(_SYS_PROMPT + "\nQuery: " + question)
+    if not resp:
+        return None
+    try:
+        m = re.search(r"\{.*\}", resp, flags=re.DOTALL)
+        js = m.group(0) if m else resp
+        obj = json.loads(js)
+        # defaults
+        obj.setdefault("intent", "mean")
+        obj.setdefault("joint", "knee")
+        obj.setdefault("side", "BOTH")
+        obj.setdefault("cond", "BOTH")
+        obj.setdefault("stat", "mean")
+        return obj
+    except Exception:
+        return None
+
+# ---------- Graph Catalog (from nodes.ndjson.gz) ----------
+
+class GraphCatalog:
+    """
+    Διαβάζει nodes.ndjson.gz και κρατά metadata για NL→Cypher.
+    Κάθε γραμμή: {"eid":..., "labels":[...], "props":{...}}
+    Περιμένουμε:
+      Subject: props.pid (π.χ. "ASD:26", "TD:8")
+      Feature: props.code, props.stat, props.joint_guess
+    """
+
+    def __init__(self, data_dir: str = ".", nodes_file: Optional[str] = None):
+        self.data_dir = data_dir
+        self.nodes_path = nodes_file or os.path.join(data_dir, "nodes.ndjson.gz")
+
+        # Derived metadata
+        self.joints: Set[str] = set()                      # πχ {'hip','knee',...}
+        self.joint_sides: Dict[str, Set[str]] = {}         # {'hip': {'L','R'}, ...}
+        self.joint_stats: Dict[str, Set[str]] = {}         # {'hip': {'mean','std',...}}
+        self.subject_counts: Dict[str, int] = {"ASD": 0, "TD": 0}
+
+        self._loaded: bool = False
+
+    def _side_from_code(self, code: str) -> Optional[str]:
+        if not isinstance(code, str):
+            return None
+        code = code.strip()
+        if re.search(r"(?i)\bL\s*$", code):
+            return "L"
+        if re.search(r"(?i)\bR\s*$", code):
+            return "R"
+        return None
+
+    def load(self) -> None:
+        if self._loaded:
+            return
+        if not os.path.exists(self.nodes_path):
+            raise FileNotFoundError(f"nodes file not found: {self.nodes_path}")
+
+        with gzip.open(self.nodes_path, "rt", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    obj = json.loads(line)
+                    labels = obj.get("labels", []) or []
+                    props = obj.get("props", {}) or {}
+                except Exception:
+                    continue
+
+                # Subjects → ASD/TD counters
+                if "Subject" in labels:
+                    pid = props.get("pid")
+                    if isinstance(pid, str):
+                        if pid.startswith("ASD:"):
+                            self.subject_counts["ASD"] += 1
+                        elif pid.startswith("TD:"):
+                            self.subject_counts["TD"] += 1
+
+                # Features → joints/sides/stats
+                if "Feature" in labels:
+                    stat = props.get("stat")
+                    code = props.get("code")
+                    jg = props.get("joint_guess")
+                    if isinstance(jg, str) and jg.strip():
+                        joint = jg.strip().lower()
+                        self.joints.add(joint)
+                        if isinstance(stat, str):
+                            self.joint_stats.setdefault(joint, set()).add(stat.strip().lower())
+                        side = self._side_from_code(code) if isinstance(code, str) else None
+                        if side in ("L", "R"):
+                            self.joint_sides.setdefault(joint, set()).add(side)
+
+        self._loaded = True
+
+    # ---- helpers ----
+    def has_joint(self, joint: str) -> bool:
+        return joint.lower() in self.joints
+
+    def available_sides(self, joint: str) -> Set[str]:
+        return self.joint_sides.get(joint.lower(), set())
+
+    def has_stat(self, joint: str, stat: str) -> bool:
+        return stat.lower() in self.joint_stats.get(joint.lower(), set())
+
+    def guess_best_stat(self, joint: str, desired: str) -> str:
+        js = self.joint_stats.get(joint.lower(), set())
+        if desired in js:
+            return desired
+        if "mean" in js:
+            return "mean"
+        return next(iter(js), "mean")
+
+
+# ---------- NL rules ----------
+
+JOINT_ALIASES: Dict[str, List[str]] = {
+    "knee":   ["knee", "γόνα", "gonato"],
+    "hip":    ["hip", "ισχ", "ischio"],
+    "ankle":  ["ankle", "ποδο", "podo", "ankl"],
+    "trunk":  ["trunk", "κορμ", "trunk tilt"],
+    "spine":  ["spine", "σπονδ"],
+    "pelvis": ["pelvis", "λεκ", "πυελ"],
+}
+
+def _detect_cond(q: str) -> str:
+    t = q.lower()
+    if "asd" in t or "αυτισ" in t: return "ASD"
+    if "td" in t or "τυπικ" in t or "control" in t: return "TD"
+    return "BOTH"
+
+def _detect_side(q: str) -> str:
+    t = q.lower()
+    if re.search(r"\b(right|δεξ|dexi| r\b)", t): return "R"
+    if re.search(r"\b(left|αριστ| l\b)", t): return "L"
+    return "BOTH"
+
+def _detect_joint(q: str, catalog: GraphCatalog) -> Optional[str]:
+    t = q.lower()
+    for canon, aliases in JOINT_ALIASES.items():
+        if any(a in t for a in aliases):
+            return canon if catalog.has_joint(canon) else None
+    for j in sorted(catalog.joints):
+        if j in t:
+            return j
+    return None
+
+def _detect_stat(q: str) -> str:
+    t = q.lower()
+    if "std" in t or "stdev" in t: return "std"
+    if "var" in t or "variance" in t or "διακύ" in t: return "var"
+    return "mean"
+
+def _detect_intent(q: str) -> str:
+    t = q.lower()
+    if "count" in t or "πόσα" in t: return "count"
+    if "correl" in t or "συσχετ" in t: return "correlations"
+    if "complete" in t or "πληρό" in t or "kinds" in t: return "completeness"
+    if "compare" in t or "σύγκρι" in t or " vs " in t: return "compare"
+    if "mean" in t or "average" in t or "μ.ο" in t or "μέση" in t: return "mean"
+    return "mean"
+
+# ---------- Cypher templates (single WHERE) ----------
+
 TEMPLATES = {
     "count": "MATCH (s:Subject) RETURN sum(CASE WHEN s.pid STARTS WITH 'ASD:' THEN 1 ELSE 0 END) AS asd_cases, sum(CASE WHEN s.pid STARTS WITH 'TD:' THEN 1 ELSE 0 END) AS td_cases;",
     "correlations": """
@@ -42,113 +234,108 @@ RETURN count(*) AS trials,
     "mean": """
 MATCH (s:Subject)-[:HAS_TRIAL]->(:Trial)-[:HAS_FEATURE]->(fv:FeatureValue)-[:OF_FEATURE]->(f:Feature)
 WHERE {where_clause}
-WITH CASE WHEN s.pid STARTS WITH 'ASD:' THEN 'ASD' WHEN s.pid STARTS WITH 'TD:' THEN 'TD' ELSE 'UNK' END AS condition,
-     {side_expr} AS side, s.pid AS pid, avg(fv.value) AS subj_mean
+WITH CASE WHEN s.pid STARTS WITH 'ASD:' THEN 'ASD'
+          WHEN s.pid STARTS WITH 'TD:'  THEN 'TD'  ELSE 'UNK' END AS condition,
+     {side_expr} AS side,
+     s.pid AS pid,
+     avg(fv.value) AS subj_mean
 RETURN condition, side, round(avg(subj_mean),2) AS mean_value, count(*) AS n
-ORDER BY condition, side;"""
+ORDER BY condition, side;""",
+    "compare_asd_td": """
+UNWIND {sides} AS side
+MATCH (s:Subject)-[:HAS_TRIAL]->(:Trial)-[:HAS_FEATURE]->(fv:FeatureValue)-[:OF_FEATURE]->(f:Feature)
+WHERE f.stat='{stat}' AND (
+  (toLower(f.joint_guess)='{joint}' AND (
+     (side='L' AND f.code =~ '(?i).*L\\s*$') OR
+     (side='R' AND f.code =~ '(?i).*R\\s*$')
+  ))
+)
+  AND s.pid STARTS WITH 'ASD:'
+WITH 'ASD' AS cond, side, avg(fv.value) AS avg_val
+RETURN cond, side, avg_val
+UNION ALL
+UNWIND {sides} AS side
+MATCH (s:Subject)-[:HAS_TRIAL]->(:Trial)-[:HAS_FEATURE]->(fv:FeatureValue)-[:OF_FEATURE]->(f:Feature)
+WHERE f.stat='{stat}' AND (
+  (toLower(f.joint_guess)='{joint}' AND (
+     (side='L' AND f.code =~ '(?i).*L\\s*$') OR
+     (side='R' AND f.code =~ '(?i).*R\\s*$')
+  ))
+)
+  AND s.pid STARTS WITH 'TD:'
+WITH 'TD' AS cond, side, avg(fv.value) AS avg_val
+RETURN cond, side, avg_val
+ORDER BY cond, side;"""
 }
 
-# ------------------- Helpers (rules) -------------------
-def _detect_condition(q: str) -> str:
-    ql = q.lower()
-    if "asd" in ql: return "ASD"
-    if "td" in ql or "τυπ" in ql or "control" in ql: return "TD"
-    return "BOTH"
+# ---------- Engine ----------
 
-def _detect_side(q: str) -> str:
-    ql = q.lower()
-    if "right" in ql or "δεξ" in ql: return "R"
-    if "left" in ql or "αριστ" in ql: return "L"
-    return "BOTH"
-
-def _detect_joint(q: str) -> Optional[str]:
-    ql = q.lower()
-    if "knee" in ql or "γόνα" in ql: return "HIAN"
-    if "hip" in ql or "ισχ" in ql: return "SPKN"
-    if "ankle" in ql or "ποδο" in ql: return "KNFO"
-    if "trunk" in ql or "κορμ" in ql: return "THHTI"
-    if "pelvis" in ql or "λεκ" in ql or "πυελ" in ql: return "SPEL"
-    return None
-
-def _detect_intent(q: str) -> str:
-    ql = q.lower()
-    if "count" in ql or "πόσα" in ql: return "count"
-    if "correl" in ql or "συσχ" in ql: return "correlations"
-    if "complete" in ql or "πλήρη" in ql: return "completeness"
-    if "compare" in ql or "σύγκρι" in ql or "vs" in ql: return "compare"
-    if "mean" in ql or "average" in ql or "μέση" in ql or "μ.ο." in ql: return "mean"
-    return "unknown"
-
-# ------------------- Ollama -------------------
-SYS_PROMPT = """You are an assistant that extracts slots from a clinical gait query.
-Return ONLY strict JSON:
-{"intent":"mean|compare|count|correlations|completeness",
- "joint":"knee|hip|ankle|trunk|pelvis",
- "side":"L|R|BOTH",
- "cond":"ASD|TD|BOTH",
- "stat":"mean|std|var"}"""
-
-def _ollama_generate(prompt: str) -> Optional[str]:
-    try:
-        r = requests.post(f"{OLLAMA_URL}/api/generate",
-                          json={"model": OLLAMA_MODEL, "prompt": prompt, "stream": False},
-                          timeout=OLLAMA_TIMEOUT)
-        if r.status_code == 200:
-            return r.json().get("response","").strip()
-    except Exception:
-        return None
-    return None
-
-def _llm_parse(q: str) -> Optional[Dict[str,str]]:
-    if not USE_LLM: return None
-    resp = _ollama_generate(SYS_PROMPT + "\nQuery: " + q)
-    if not resp: return None
-    try:
-        js = re.search(r"\{.*\}", resp, re.DOTALL).group(0)
-        return json.loads(js)
-    except Exception:
-        return None
-
-# ------------------- Engine -------------------
 class NL2Cypher:
-    def __init__(self): pass
+    """Φτιάχνει Cypher αξιοποιώντας GraphCatalog από JSON export του γράφου."""
 
-    def to_cypher(self, q: str) -> str:
-        q = (q or "").strip()
+    def __init__(self, data_dir: Optional[str] = None, nodes_file: Optional[str] = None, catalog: Optional[GraphCatalog] = None):
+        if catalog is not None:
+            self.catalog = catalog
+        else:
+            dd = data_dir or os.getenv("GRAPH_JSON_DIR", ".")
+            self.catalog = GraphCatalog(dd, nodes_file=nodes_file)
+            self.catalog.load()
+
+    def to_cypher(self, question: str) -> str:
+        q = (question or "").strip()
         if not q:
             return "MATCH (n) RETURN count(n) AS nodes LIMIT 1;"
 
-        # 1. Rule-based
+        # 1) κανόνες πάνω στον κατάλογο (exact)
         intent = _detect_intent(q)
-        cond   = _detect_condition(q)
-        side   = _detect_side(q)
-        joint  = _detect_joint(q)
+        cond = _detect_cond(q)
+        side = _detect_side(q)
+        joint = _detect_joint(q, self.catalog) or self._fallback_joint()
+        stat = _detect_stat(q)
+        stat = self.catalog.guess_best_stat(joint, stat)
 
-        if intent in ("count","correlations","completeness"):
-            return TEMPLATES[intent]
+        if intent == "count":
+            return TEMPLATES["count"].strip()
+        if intent == "correlations":
+            return TEMPLATES["correlations"].strip()
+        if intent == "completeness":
+            return TEMPLATES["completeness"].strip()
+        if intent == "compare":
+            sides_val = "['L','R']" if side == "BOTH" else f"['{side}']"
+            return TEMPLATES["compare_asd_td"].format(
+                sides=sides_val, stat=stat, joint=joint
+            ).strip()
 
-        if intent == "mean" and joint:
-            side_expr = f"'{side}'" if side in ("L","R") else "CASE WHEN f.code =~ '(?i).*L$' THEN 'L' ELSE 'R' END"
-            regex = f"(?i).*{joint}{side}\\s*$" if side in ("L","R") else f"(?i).*{joint}[LR]\\s*$"
-            where_clause = f"s.pid STARTS WITH '{cond}:' AND f.stat='mean' AND f.code =~ '{regex}'" if cond!="BOTH" else f"f.stat='mean' AND f.code =~ '{regex}'"
-            return TEMPLATES["mean"].format(where_clause=where_clause, side_expr=side_expr)
+        # default: mean
+        # προσαρμογή πλευράς σύμφωνα με το τι υπάρχει στον γράφο
+        sides_avail = self.catalog.available_sides(joint)
+        if side in ("L","R") and side not in sides_avail:
+            side = "BOTH"
 
-        # 2. If no exact match → LLM
-        slots = _llm_parse(q)
-        if slots:
-            intent = slots.get("intent","mean").lower()
-            cond   = slots.get("cond","BOTH").upper()
-            side   = slots.get("side","BOTH").upper()
-            joint  = slots.get("joint","knee").lower()
-            stat   = slots.get("stat","mean").lower()
-            if intent=="count": return TEMPLATES["count"]
-            if intent=="correlations": return TEMPLATES["correlations"]
-            if intent=="completeness": return TEMPLATES["completeness"]
-            if intent=="mean":
-                side_expr = f"'{side}'" if side in ("L","R") else "CASE WHEN f.code =~ '(?i).*L$' THEN 'L' ELSE 'R' END"
-                regex = f"(?i).*{joint.upper()}{side}\\s*$" if side in ("L","R") else f"(?i).*{joint.upper()}[LR]\\s*$"
-                where_clause = f"s.pid STARTS WITH '{cond}:' AND f.stat='{stat}' AND f.code =~ '{regex}'" if cond!="BOTH" else f"f.stat='{stat}' AND f.code =~ '{regex}'"
-                return TEMPLATES["mean"].format(where_clause=where_clause, side_expr=side_expr)
+        if side == "BOTH":
+            where_parts = []
+            if cond != "BOTH":
+                where_parts.append(f"s.pid STARTS WITH '{cond}:'")
+            where_parts.append(f"f.stat='{stat}'")
+            where_parts.append(
+                f"(toLower(f.joint_guess)='{joint}' AND (f.code =~ '(?i).*L\\s*$' OR f.code =~ '(?i).*R\\s*$'))"
+            )
+            where_clause = " AND ".join(where_parts)
+            side_expr = "CASE WHEN f.code =~ '(?i).*L\\s*$' THEN 'L' ELSE 'R' END"
+            return TEMPLATES["mean"].format(where_clause=where_clause, side_expr=side_expr).strip()
+        else:
+            where_parts = []
+            if cond != "BOTH":
+                where_parts.append(f"s.pid STARTS WITH '{cond}:'")
+            where_parts.append(f"f.stat='{stat}'")
+            where_parts.append(
+                f"(toLower(f.joint_guess)='{joint}' AND f.code =~ '(?i).*{side}\\s*$')"
+            )
+            where_clause = " AND ".join(where_parts)
+            side_expr = f"'{side}'"
+            return TEMPLATES["mean"].format(where_clause=where_clause, side_expr=side_expr).strip()
 
-        # 3. Fallback
-        return "MATCH (n) RETURN count(n) AS nodes LIMIT 1;"
+    def _fallback_joint(self) -> str:
+        if "knee" in self.catalog.joints:
+            return "knee"
+        return next(iter(sorted(self.catalog.joints)), "knee")
