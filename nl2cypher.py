@@ -229,10 +229,10 @@ def _joint_filter(joint: str) -> str:
     stem = JOINT_CODE_STEM.get(joint.lower(), "")
     if stem:
         return (
-            f"( (exists(f.joint_guess) AND toLower(f.joint_guess)='{joint.lower()}') "
+            f"( (f.joint_guess IS NOT NULL AND toLower(f.joint_guess)='{joint.lower()}') "
             f"OR f.code =~ '(?i).*{stem}.*' )"
         )
-    return f"(exists(f.joint_guess) AND toLower(f.joint_guess)='{joint.lower()}')"
+    return f"(f.joint_guess IS NOT NULL AND toLower(f.joint_guess)='{joint.lower()}')"
 
 # ---------- Cypher templates ----------
 
