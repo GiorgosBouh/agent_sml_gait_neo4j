@@ -10,7 +10,6 @@ transformers>=4.41
 sentencepiece
 accelerate>=0.28
 streamlit>=1.36
-streamlit>=1.36
 requests>=2.32
 transformers>=4.41
 torch>=2.3
