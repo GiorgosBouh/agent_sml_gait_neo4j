@@ -190,6 +190,13 @@ class NL2Cypher:
         if not looks_like_cypher(cy):
             return ""
         return cy
+    def __init__(self):
+        pass
+
+    def to_cypher(self, question: str) -> str:
+        # placeholder: μπορείς να καλέσεις το generate_cypher_local εδώ
+        cypher, _ = generate_cypher_local(question)
+        return cypher
 
     def __call__(self, user_q: str, synonyms: Dict[str,str], fewshots: List[Dict[str,str]]) -> str:
         # 1) Normalize + synonyms

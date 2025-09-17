@@ -405,7 +405,6 @@ LIMIT {limit};
                 st.exception(e)
 
 # Tab 4 — Help
-# Tab 4 — Help
 with tabs[3]:
     st.subheader("ℹ️ How to use")
     st.markdown("""
